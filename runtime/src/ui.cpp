@@ -2,10 +2,12 @@
 // SDL wants its events pumped on the thread that made the window, so a dedicated UI thread owns both.
 #define SDL_MAIN_HANDLED
 #include <SDL3/SDL.h>
-#include <windows.h>
+#include "plat.h"
+#ifdef _WIN32
 #include <timeapi.h>
 #include <psapi.h>
 #include <intrin.h>
+#endif
 
 #include <algorithm>
 #include <thread>
@@ -72,6 +74,7 @@ static void pace_variable(int fps) {
 // median ones: wall ms, ms the game thread really ran (QueryThreadCycleTime), process CPU ms (all threads) and page faults.
 // Running ~= wall: the slow frame is more work; running << wall: the thread was not running (lock, preemption, kernel).
 static void stall_stats() {
+#ifdef _WIN32
     static const bool on = getenv("NX_STALL_STATS") != nullptr;
     if (!on) return;
     struct F { float wall, run, proc, pf; };
@@ -109,6 +112,7 @@ static void stall_stats() {
             k, s.wall, s.run, s.proc, s.pf, m.wall, m.run, m.proc, m.pf, v[0].wall, v[0].run, v[0].pf);
         v.clear(), win_q = q.QuadPart, win_t = t;
     }
+#endif  // NX_STALL_STATS: Windows only (thread / process cycle counters)
 }
 
 std::atomic<uint64_t> g_pace_us{0};  // time inside pace_present (cap / present waits), frame stats
@@ -353,7 +357,11 @@ static void poll_input() {
     static bool f1_prev = false;
     bool f1 = k[SDL_SCANCODE_F1] && !f1_prev;
     f1_prev = k[SDL_SCANCODE_F1];
+#ifdef _WIN32
     void* hwnd = SDL_GetPointerProperty(SDL_GetWindowProperties(g_window), SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr);
+#else
+    void* hwnd = g_window;  // Linux: the menu is drawn into the frame (overlay.cpp), it only needs the window size
+#endif
     if (hwnd && overlay_update(hwnd, p.buttons, p.ly, f1)) p = PadState{};
     p.buttons |= overlay_buttons();
     std::lock_guard<std::mutex> l(g_ui_lock);
@@ -368,6 +376,7 @@ void ui_set_fullscreen(bool on) { SDL_SetWindowFullscreen(g_window, on); }
 static void vsync_thread() {
     // Windows 11 power throttling (EcoQoS) coalesces timers and slows threads of a window that is not in front: the
     // clock fired up to 36 ms late. Opt the process and this thread out (no-op on older Windows).
+#ifdef _WIN32
     PROCESS_POWER_THROTTLING_STATE pp{PROCESS_POWER_THROTTLING_CURRENT_VERSION,
                                       PROCESS_POWER_THROTTLING_EXECUTION_SPEED | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION, 0};
     BOOL ok1 = SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &pp, sizeof pp);
@@ -375,6 +384,7 @@ static void vsync_thread() {
     BOOL ok2 = SetThreadInformation(GetCurrentThread(), ThreadPowerThrottling, &tp, sizeof tp);
     log("vsync: power throttling opt-out process %d thread %d (error %lu)", ok1, ok2, GetLastError());
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+#endif
     const uint64_t freq = SDL_GetPerformanceFrequency();
     uint64_t base = SDL_GetPerformanceCounter(), k = 0;  // tick k is due at base + k * freq / (60 * speed), no drift
     int speed = g_speed;
@@ -432,6 +442,7 @@ static void ui_thread() {
     g_window = SDL_CreateWindow("Tokyo Mirage Sessions #FE Encore (TMSRecomp)", 1280, 720, SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE);
     if (!g_window) fatal("SDL_CreateWindow: %s", SDL_GetError());
     // <data>/icon.ico: the launcher makes it from the player's own game (NSP icon or title screen); none = default icon
+#ifdef _WIN32
     if (HWND hw = (HWND)SDL_GetPointerProperty(SDL_GetWindowProperties(g_window), SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr)) {
         const std::string ico = g_data_dir + "/icon.ico";
         HICON big = (HICON)LoadImageA(nullptr, ico.c_str(), IMAGE_ICON, GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), LR_LOADFROMFILE);
@@ -439,6 +450,7 @@ static void ui_thread() {
         if (big) SendMessageW(hw, WM_SETICON, ICON_BIG, (LPARAM)big);
         if (sml) SendMessageW(hw, WM_SETICON, ICON_SMALL, (LPARAM)sml);
     }
+#endif
     // NX_WINDOW=borderless: borderless fullscreen on the window's display (play.bat default); Alt+Enter or F11 toggles
     if (const char* w = getenv("NX_WINDOW"); w && !strcmp(w, "borderless")) SDL_SetWindowFullscreen(g_window, true);
     {
@@ -446,7 +458,9 @@ static void ui_thread() {
         g_ui_ready = true;
     }
     g_ui_ready_cv.notify_all();
+#ifdef _WIN32
     timeBeginPeriod(1);
+#endif
     if (const SDL_DisplayMode* m = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(g_window)))
         log("ui: display %dx%d @ %.3f Hz", m->w, m->h, m->refresh_rate), g_refresh_hz = (int)(m->refresh_rate + 0.5f);
     std::thread(vsync_thread).detach();
@@ -456,7 +470,11 @@ static void ui_thread() {
             if (e.type == SDL_EVENT_QUIT) {
                 log("window closed");
                 fflush(nullptr);
+#ifdef _WIN32
                 ExitProcess(0);
+#else
+                _exit(0);  // as ExitProcess: no static destructors while the game threads still run
+#endif
             }
             if (e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat &&
                 (e.key.key == SDLK_F11 || (e.key.key == SDLK_RETURN && (e.key.mod & SDL_KMOD_ALT))))

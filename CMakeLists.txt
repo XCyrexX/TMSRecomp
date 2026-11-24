@@ -13,6 +13,7 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${NX_GEN}/files.
 file(STRINGS "${NX_GEN}/files.txt" GEN_FILES)
 list(TRANSFORM GEN_FILES PREPEND "${NX_GEN}/")
 
+if(WIN32)
 # libvpx (VP9 movies): source tree + a build dir configured by its ./configure, listed by tools/vpx_sources.py
 # AMD FidelityFX / FSR SDK 2.4.0 (MIT parts only: api + upscaler headers, the two Vulkan DLLs; NOTES s62)
 set(NX_FFX "${CMAKE_SOURCE_DIR}/private/third_party/FidelityFX-SDK-2.4.0/Kits/FidelityFX" CACHE PATH "FidelityFX SDK Kits/FidelityFX dir")
@@ -79,3 +80,38 @@ add_custom_command(OUTPUT "${CMAKE_BINARY_DIR}/game.dll"
     "${CMAKE_BINARY_DIR}/nx_crt_math.lib" "${CMAKE_BINARY_DIR}/nx_vcruntime.lib" tms
   USES_TERMINAL)
 add_custom_target(game_dll ALL DEPENDS "${CMAKE_BINARY_DIR}/game.dll")
+
+else()
+# ------------------------------------------------------------------------------------------------ Linux
+# tms (the runtime) + game.so (the lifted code, tools/setup/build_game.py, as the player's setup builds it). System
+# libraries through pkg-config: SDL3, Vulkan headers, libvpx (VP9 movies), cairo + pango (menu, subtitles, button icons).
+# No FSR 3 or DLSS on Linux (vk_fsr3.cpp / vk_dlss.cpp report them unavailable).
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(NX_LINUX_DEPS REQUIRED IMPORTED_TARGET sdl3 vulkan vpx cairo pangocairo)
+find_package(Threads REQUIRED)
+
+file(GLOB RT_SOURCES CONFIGURE_DEPENDS runtime/src/*.cpp)
+add_executable(tms ${RT_SOURCES})
+# tms exports the runtime entry points (guest.h NX_API) that game.so calls: -rdynamic
+set_target_properties(tms PROPERTIES ENABLE_EXPORTS ON)
+target_include_directories(tms PRIVATE runtime/include runtime/src)
+target_compile_options(tms PRIVATE -ffp-contract=off -fno-strict-aliasing -Wno-unused-parameter)
+target_link_libraries(tms PRIVATE PkgConfig::NX_LINUX_DEPS Threads::Threads ${CMAKE_DL_LIBS})
+add_custom_command(TARGET tms POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_SOURCE_DIR}/data/subtitles_en.tsv" $<TARGET_FILE_DIR:tms>)
+add_custom_command(TARGET tms POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_SOURCE_DIR}/data/resist_icons" $<TARGET_FILE_DIR:tms>/resist_icons)
+# launcher next to tms: the same pages as on Windows, through runtime/launcher/linux_shim.h (SDL3 + cairo / pango)
+add_executable(launcher runtime/launcher/launcher.cpp)
+target_include_directories(launcher PRIVATE runtime/include runtime/src)
+target_link_libraries(launcher PRIVATE PkgConfig::NX_LINUX_DEPS Threads::Threads)
+
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+find_program(NX_LD_LLD ld.lld REQUIRED)
+set(NX_SETUP "${CMAKE_SOURCE_DIR}/tools/setup")
+add_custom_command(OUTPUT "${CMAKE_BINARY_DIR}/game.so"
+  COMMAND "${Python3_EXECUTABLE}" "${NX_SETUP}/build_game.py" --gen "${NX_GEN}" --obj "${CMAKE_BINARY_DIR}/game_obj"
+    --out "${CMAKE_BINARY_DIR}/game.so" --include "${CMAKE_SOURCE_DIR}/runtime/include" --clang "${CMAKE_C_COMPILER}"
+    --lld "${NX_LD_LLD}"
+  DEPENDS ${GEN_FILES} "${NX_GEN}/funcs.h" runtime/include/guest.h "${NX_SETUP}/build_game.py"
+  USES_TERMINAL)
+add_custom_target(game_so ALL DEPENDS "${CMAKE_BINARY_DIR}/game.so")
+endif()

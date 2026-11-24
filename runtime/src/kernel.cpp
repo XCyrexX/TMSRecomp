@@ -1,7 +1,10 @@
 // Horizon kernel, high level: the SVCs the SDK's own nn::os code issues (32-bit register ABI, read from the
 // SDK's svc wrappers: inputs r0-r4, result r0, outputs r1-r3). Semantics from Switchbrew.
 // ponytail: one big kernel lock + per-thread condition variables; split it if contention ever shows in a profile.
-#include <windows.h>
+#include "plat.h"
+#ifndef _WIN32
+#include <pthread.h>
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -10,6 +13,9 @@
 #include <thread>
 
 #include "rt.h"
+#ifndef _WIN32
+#undef R_OK  // <unistd.h> access() mode; here the Horizon result code below
+#endif
 
 namespace rt {
 
@@ -102,7 +108,11 @@ static void reacquire(KThread* w) {
 }
 
 // ------------------------------------------------------------------------------------------------ threads
+#ifdef _WIN32
 static DWORD WINAPI thread_proc(void* p) {
+#else
+static void* thread_proc(void* p) {
+#endif
     KThread* t = static_cast<KThread*>(p);
     t_cur = t;
     try {
@@ -286,9 +296,20 @@ static void svc_impl(Cpu* c, uint32_t imm) {
             }
             if (!nt) { r[0] = R_BAD_HANDLE; return; }
             nt->started = true;
+#ifdef _WIN32
             HANDLE h = CreateThread(nullptr, HOST_STACK, thread_proc, nt, STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
             if (!h) fatal("host CreateThread failed");
             CloseHandle(h);
+#else
+            pthread_attr_t at;
+            pthread_attr_init(&at);
+            pthread_attr_setstacksize(&at, HOST_STACK);  // reserved, touched on demand (as the Windows reservation)
+            pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+            pthread_t th;
+            const int e = pthread_create(&th, &at, thread_proc, nt);
+            pthread_attr_destroy(&at);
+            if (e) fatal("host pthread_create failed (%s)", strerror(e));
+#endif
             // On the console a higher-priority thread preempts its creator at once; games rely on it (e.g. reading
             // arguments from the creator's stack). Let it run until its first svc (or 100 ms) before returning.
             if (t && nt->prio < t->prio) {

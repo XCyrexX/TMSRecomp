@@ -2,6 +2,7 @@
 // from guest memory into a staging ring, then copy into the Vulkan image. Block-linear layout: GOB = 64 bytes x 8
 // rows; blocks are 1 GOB wide and 2^n GOBs tall (n chosen per level from its height, at most 16 GOBs), row-major.
 // The block-height rule is the common Tegra one and is an assumption for this driver: check textures on screen.
+#include "plat.h"
 #include "vk.h"
 
 #include <chrono>

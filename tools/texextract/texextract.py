@@ -7,7 +7,8 @@ without playing through the game.
 Textures live in BNTX containers (Interface .gtx files, and inside .apak / .bfres / .ptcl / .pspk files): every
 "BNTX" found in a file is parsed. Mods are applied like tms.exe does (<data>/mods/<name>/romfs/Pack/<pack>.cpk
 replaces the pack, first enabled mod by name; settings.ini mods_disabled is honoured), so hashes match what the game
-loads. Needs fasttex.dll next to this file (clang -O2 -shared -o fasttex.dll fasttex.c).
+loads. Needs fasttex.dll next to this file (clang -O2 -shared -o fasttex.dll fasttex.c); on Linux fasttex.so
+(clang -O2 -shared -fPIC -o fasttex.so fasttex.c).
 """
 import argparse
 import ctypes
@@ -18,7 +19,8 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from cpk import Cpk  # noqa: E402
 
-dll = ctypes.CDLL(os.path.join(os.path.dirname(os.path.abspath(__file__)), "fasttex.dll"))
+dll = ctypes.CDLL(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "fasttex.so" if sys.platform.startswith("linux") else "fasttex.dll"))
 dll.tex_hash.restype = ctypes.c_uint64
 dll.tex_hash.argtypes = [ctypes.c_char_p, ctypes.c_size_t]
 dll.untile.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32]

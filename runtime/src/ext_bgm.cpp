@@ -18,7 +18,9 @@
 //   7 = the game's level). Measured 11-01: the game's BGM files (Common.awb, plain ADX) have RMS 3400..6400 (quartiles)
 //   and come out ~0.175 x (field music ~750 in the audio log); battle tracks are the loud ones -> ~1100. The P5R files
 //   are 4800..12300, so the old fixed 0.7 gain was 10..18 dB louder than the game (user 11-01: far too loud).
-#include <windows.h>
+#include "plat.h"
+
+#include <filesystem>
 
 #include <algorithm>
 #include <cmath>
@@ -47,8 +49,36 @@ std::string lower(std::string s) {
 }
 std::string folder() {
     const char* d = getenv("NX_CUSTOM_BGM_DIR");
+#ifdef _WIN32
     return d && *d ? std::string(d) : g_data_dir + "\\music";
+#else
+    return d && *d ? std::string(d) : g_data_dir + "/music";
+#endif
 }
+#ifndef _WIN32
+void scan() {  // Linux: every *.adx (any case) in the folder, sorted
+    const std::string dir = folder();
+    std::vector<std::string> names;
+    std::error_code ec;
+    for (auto& e : std::filesystem::directory_iterator(dir, ec)) {
+        const std::string n = e.path().filename().string();
+        if (n.size() > 4 && lower(n.substr(n.size() - 4)) == ".adx") names.push_back(n);
+    }
+    if (names.empty()) { log("custom music: no .adx files in %s", dir.c_str()); return; }
+    std::sort(names.begin(), names.end());
+    for (const std::string& name : names) {
+        const std::string stem = name.substr(0, name.size() - 4);
+        const size_t a = stem.find('_'), b = a == std::string::npos ? a : stem.find('_', a + 1);
+        Track t{dir + "/" + name, b == std::string::npos ? "" : stem.substr(a + 1, b - a - 1),
+                lower(stem).find("victory") != std::string::npos};
+        if (t.series == "P4") t.series = "Persona 4";
+        g_tracks.push_back(t);
+    }
+    int v = 0;
+    for (auto& t : g_tracks) v += t.victory;
+    log("custom music: %zu battle tracks, %d victory themes in %s", g_tracks.size() - v, v, dir.c_str());
+}
+#else
 void scan() {
     const std::string dir = folder();
     WIN32_FIND_DATAA fd;
@@ -67,6 +97,7 @@ void scan() {
     for (auto& t : g_tracks) v += t.victory;
     log("custom music: %zu battle tracks, %d victory themes in %s", g_tracks.size() - v, v, dir.c_str());
 }
+#endif
 const Track* pick_battle() {
     std::vector<const Track*> v;
     for (auto& t : g_tracks) if (!t.victory) v.push_back(&t);

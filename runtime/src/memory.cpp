@@ -1,9 +1,17 @@
 // Guest memory: one 4 GiB reservation at GUEST_BASE, committed on demand, plus a region map for QueryMemory.
+#ifdef _WIN32
 #include <windows.h>
 #include <psapi.h>
+#include <malloc.h>
+#else
+#include <sys/mman.h>
+#include <unistd.h>
+#include <cerrno>
+#include <cstring>
+#include <fstream>
+#endif
 
 #include <map>
-#include <malloc.h>
 #include <string>
 
 #include "rt.h"
@@ -16,20 +24,82 @@ static uint32_t g_kernel_next = KERNEL_BASE;
 static uint32_t g_hle_next = HLE_BASE;
 static uint32_t g_heap_size = 0;
 
+constexpr uint64_t k_window = 0x100010000ull;  // 4 GiB + 64 KiB: a 32-bit address plus a small displacement stays inside
+
+#ifndef _WIN32
+// Linux has no write watch (Windows MEM_WRITE_WATCH / GetWriteWatch), so it is built from page protection: each page of
+// the window is free (PROT_NONE), dirty (read-write, written since the last check) or watched (read-only: the first
+// write faults, mem_fault marks the page dirty and opens it again). mem_written re-arms the dirty pages it reports.
+// Pages of the window are only ever watched after mem_written was called on them (texture pools), so the rest of the
+// game's memory never faults.
+enum : uint8_t { PG_FREE = 0, PG_WATCHED = 1, PG_DIRTY = 2 };
+static std::atomic<uint8_t>* g_pages;  // k_window >> 12 entries
+static void protect(uint64_t lo, uint64_t len, int prot) {
+    if (mprotect((void*)(GUEST_BASE + lo), len, prot)) fatal("mprotect %llx+%llx failed (%s)", (unsigned long long)lo, (unsigned long long)len, strerror(errno));
+}
+bool mem_fault(void* host_addr) {  // SIGSEGV handler (main.cpp): true = a watched page, the access can run again
+    const uint64_t a = (uint64_t)host_addr;
+    if (!g_pages || a < GUEST_BASE || a >= GUEST_BASE + k_window) return false;
+    const uint64_t pg = (a - GUEST_BASE) >> 12;
+    if (g_pages[pg].load() == PG_FREE) return false;  // not committed: a real crash
+    // dirty first, then writable: a concurrent mem_written either sees the dirty mark or re-arms after us (the next
+    // write then faults again and lands here). mprotect is async-signal-safe.
+    g_pages[pg].store(PG_DIRTY);
+    mprotect((void*)(GUEST_BASE + (pg << 12)), 0x1000, PROT_READ | PROT_WRITE);
+    return true;
+}
+#endif
+
 void mem_init() {
+#ifdef _WIN32
     // 4 GiB + 64 KiB so that a 32-bit address plus a small displacement never leaves the reservation. Write-watched:
     // the NVN backend asks which pages the CPU wrote (pool textures changed after upload).
-    void* p = VirtualAlloc((void*)GUEST_BASE, 0x100010000ull, MEM_RESERVE | MEM_WRITE_WATCH, PAGE_NOACCESS);
+    void* p = VirtualAlloc((void*)GUEST_BASE, k_window, MEM_RESERVE | MEM_WRITE_WATCH, PAGE_NOACCESS);
     if (p != (void*)GUEST_BASE) fatal("cannot reserve guest memory at %llx (error %lu)", GUEST_BASE, GetLastError());
+#else
+    void* p = mmap((void*)GUEST_BASE, k_window, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE, -1, 0);
+    if (p != (void*)GUEST_BASE) fatal("cannot reserve guest memory at %llx (%s)", GUEST_BASE, strerror(errno));
+    madvise(p, k_window, MADV_DONTFORK);  // helper processes (shader translator) never copy it
+    g_pages = new std::atomic<uint8_t>[k_window >> 12]();
+#endif
 }
 
 std::atomic<uint64_t> g_commit_pages{0};  // NX_STALL_STATS
 static void commit(uint32_t addr, uint32_t size) {
     if (!size) return;
     g_commit_pages += size >> 12;
+#ifdef _WIN32
     if (!VirtualAlloc(GPTR(addr), size, MEM_COMMIT, PAGE_READWRITE))
         fatal("commit %08x+%x failed (error %lu)", addr, size, GetLastError());
+#else
+    // committed pages keep their contents (as VirtualAlloc MEM_COMMIT); new ones read as zero
+    const uint64_t lo = addr & ~0xFFFull, hi = ((uint64_t)addr + size + 0xFFF) & ~0xFFFull;
+    for (uint64_t pg = lo >> 12; pg < hi >> 12; pg++) g_pages[pg].store(PG_DIRTY);
+    protect(lo, hi - lo, PROT_READ | PROT_WRITE);
+#endif
 }
+
+#ifdef _WIN32
+void mem_make_writable(uint32_t, uint32_t) {}
+#else
+void mem_make_writable(uint32_t addr, uint32_t size) {  // before the kernel or a driver writes there (pinning for Vulkan)
+    const uint64_t lo = addr & ~0xFFFull, hi = ((uint64_t)addr + size + 0xFFF) & ~0xFFFull;
+    bool any = false;
+    for (uint64_t pg = lo >> 12; pg < hi >> 12; pg++) {
+        uint8_t w = PG_WATCHED;
+        if (g_pages[pg].compare_exchange_strong(w, PG_DIRTY)) any = true;
+    }
+    if (any) {
+        for (uint64_t pg = lo >> 12; pg < hi >> 12;) {  // open the committed runs (free pages stay PROT_NONE)
+            if (g_pages[pg].load() == PG_FREE) { pg++; continue; }
+            uint64_t e = pg;
+            while (e < hi >> 12 && g_pages[e].load() != PG_FREE) e++;
+            protect(pg << 12, (e - pg) << 12, PROT_READ | PROT_WRITE);
+            pg = e;
+        }
+    }
+}
+#endif
 
 static void carve(uint32_t addr, uint32_t size) {  // remove [addr, addr+size) from the map, splitting neighbours
     uint64_t end = (uint64_t)addr + size;
@@ -55,9 +125,47 @@ void mem_map(uint32_t addr, uint32_t size, uint32_t state, uint32_t perm) {
 void mem_unmap(uint32_t addr, uint32_t size) {
     std::lock_guard<std::mutex> l(g_mem_lock);
     carve(addr, size);
+#ifdef _WIN32
     VirtualFree(GPTR(addr), size, MEM_DECOMMIT);
+#else
+    const uint64_t lo = addr & ~0xFFFull, hi = ((uint64_t)addr + size + 0xFFF) & ~0xFFFull;
+    for (uint64_t pg = lo >> 12; pg < hi >> 12; pg++) g_pages[pg].store(PG_FREE);
+    madvise((void*)(GUEST_BASE + lo), hi - lo, MADV_DONTNEED);  // contents gone, as MEM_DECOMMIT
+    protect(lo, hi - lo, PROT_NONE);
+#endif
 }
 
+#ifndef _WIN32
+double process_private_mb() {  // resident anonymous memory of the process (leak checks in the logs)
+    std::ifstream f("/proc/self/status");
+    for (std::string l; std::getline(f, l);)
+        if (l.rfind("RssAnon:", 0) == 0) return atof(l.c_str() + 8) / 1024.0;
+    return 0;
+}
+void mem_regions_report() {}  // NX_MEM_REGIONS: Windows only (VirtualQuery / heap walk)
+double guest_committed_mb() {  // the game's own memory: committed pages of the window
+    uint64_t n = 0;
+    for (uint64_t pg = 0; pg < k_window >> 12; pg++) n += g_pages[pg].load(std::memory_order_relaxed) != PG_FREE;
+    return n / 256.0;
+}
+std::atomic<uint64_t> g_ww_reset_pages{0};
+bool mem_written(uint32_t addr, uint32_t size) {  // CPU wrote [addr, addr+size) since the last call for it
+    if (!size) return false;
+    const uint64_t lo = addr & ~0xFFFull, hi = ((uint64_t)addr + size + 0xFFF) & ~0xFFFull;
+    bool any = false;
+    for (uint64_t pg = lo >> 12; pg < hi >> 12;) {  // re-arm each run of dirty pages
+        uint8_t d = PG_DIRTY;
+        if (!g_pages[pg].compare_exchange_strong(d, PG_WATCHED)) { pg++; continue; }
+        uint64_t e = pg + 1;
+        for (d = PG_DIRTY; e < hi >> 12 && g_pages[e].compare_exchange_strong(d, PG_WATCHED); d = PG_DIRTY) e++;
+        protect(pg << 12, (e - pg) << 12, PROT_READ);
+        g_ww_reset_pages += e - pg;
+        any = true;
+        pg = e;
+    }
+    return any;
+}
+#else
 double process_private_mb() {  // committed private memory of the process (leak checks in the logs)
     PROCESS_MEMORY_COUNTERS_EX pm{};
     GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS*)&pm, sizeof pm);
@@ -138,6 +246,7 @@ bool mem_written(uint32_t addr, uint32_t size) {  // CPU wrote [addr, addr+size)
     g_ww_reset_pages += len >> 12;
     return true;
 }
+#endif
 
 Region mem_query(uint32_t addr) {
     std::lock_guard<std::mutex> l(g_mem_lock);

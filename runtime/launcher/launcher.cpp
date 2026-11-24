@@ -1,6 +1,9 @@
 // TMSRecomp launcher (launcher.exe next to tms.exe): edits settings.ini, manages mods, updates from GitHub releases
 // and starts the game. Drawn with Direct2D / DirectWrite (Windows components, no other dependency). Only keys this
 // window knows are rewritten; comments and any other lines in settings.ini are kept.
+// Linux: the same pages through linux_shim.h (SDL3 window, cairo / pango drawing); its own window loop, setup runner
+// and update check are below, next to the Windows versions.
+#ifdef _WIN32
 #include <windows.h>
 #include <d2d1.h>
 #include <dwmapi.h>
@@ -10,10 +13,22 @@
 #include <wincodec.h>
 #include <winhttp.h>
 #include <windowsx.h>
+#include <commdlg.h>
+#else
+#include "linux_shim.h"
+#include <csignal>
+#include <cstring>
+#include <locale>
+#include <fcntl.h>
+#include <spawn.h>
+#include <sys/wait.h>
+#include <unistd.h>
+extern char** environ;
+#endif
 
 #include <algorithm>
 #include <atomic>
-#include <commdlg.h>
+#include <cmath>
 #include <mutex>
 #include <filesystem>
 #include <fstream>
@@ -68,6 +83,7 @@ static void set(const char* k, const std::string& v) {
 }
 
 // ANSI like tms.exe's getenv (ponytail: non-ASCII data paths need the wide-char API on both sides).
+#ifdef _WIN32
 static std::wstring wide(const std::string& s) {
     std::wstring w(MultiByteToWideChar(CP_ACP, 0, s.c_str(), -1, nullptr, 0), 0);
     MultiByteToWideChar(CP_ACP, 0, s.c_str(), -1, w.data(), (int)w.size());
@@ -80,6 +96,10 @@ static std::string narrow(const std::wstring& w) {
     s.pop_back();
     return s;
 }
+#else
+static std::wstring wide(const std::string& s) { return draw::wide(s); }  // Linux: UTF-8 everywhere
+static std::string narrow(const std::wstring& w) { return draw::utf8(w); }
+#endif
 
 static bool is_data(const fs::path& p) {
     std::error_code ec;
@@ -271,6 +291,8 @@ static std::string g_rel_tag, g_rel_zip, g_rel_page;
 static HWND g_wnd;
 constexpr UINT WM_UPD = WM_APP + 1;
 
+
+#ifdef _WIN32
 static bool http_get(const std::wstring& url, std::string* body, HANDLE file) {
     URL_COMPONENTS u{sizeof u};
     wchar_t host[256], path[2048], extra[1024];
@@ -302,6 +324,9 @@ static bool http_get(const std::wstring& url, std::string* body, HANDLE file) {
     if (s) WinHttpCloseHandle(s);
     return ok;
 }
+#else
+static bool http_get(const std::wstring& url, std::string* body, HANDLE file);  // below
+#endif
 
 // The string value of "key" after position from (JSON written by GitHub: no escapes in these values but \/).
 static std::string json_str(const std::string& j, const char* key, size_t from = 0, size_t* at = nullptr) {
@@ -340,6 +365,9 @@ static void check_updates() {
                 if (u.empty()) break;
                 if (u.size() > 4 && u.substr(u.size() - 4) == ".zip") { g_rel_zip = u; break; }
             }
+#ifndef _WIN32
+            g_rel_zip = g_rel_page;  // Linux: a newer release is shown with its page (apply_update opens it)
+#endif
         }
         g_upd = !ok || g_rel_tag.empty() ? UPD_FAIL
               : version_parts(g_rel_tag) > version_parts(k_version) && !g_rel_zip.empty() ? UPD_NEW : UPD_LATEST;
@@ -347,6 +375,7 @@ static void check_updates() {
     }).detach();
 }
 
+#ifdef _WIN32
 static bool run_wait(std::wstring cmd) {
     STARTUPINFOW si{sizeof si};
     PROCESS_INFORMATION pi;
@@ -407,11 +436,65 @@ static void apply_update() {
         PostMessageW(g_wnd, WM_UPD, 0, ok ? 1 : 0);
     }).detach();
 }
+#else
+// Linux helpers: start a program (argv[0] looked up in PATH), optionally with its output on a pipe, in its own process
+// group (so Cancel stops it and everything it started).
+static pid_t spawn(const std::vector<std::string>& args, const fs::path& cwd, int* out_fd, bool own_group) {
+    int p[2] = {-1, -1};
+    if (out_fd && pipe2(p, O_CLOEXEC)) return -1;
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    if (out_fd) posix_spawn_file_actions_adddup2(&fa, p[1], 1), posix_spawn_file_actions_adddup2(&fa, p[1], 2);
+    if (!cwd.empty()) posix_spawn_file_actions_addchdir_np(&fa, cwd.c_str());
+    posix_spawnattr_t at;
+    posix_spawnattr_init(&at);
+    if (own_group) posix_spawnattr_setflags(&at, POSIX_SPAWN_SETPGROUP), posix_spawnattr_setpgroup(&at, 0);
+    std::vector<char*> argv;
+    for (auto& a : args) argv.push_back(const_cast<char*>(a.c_str()));
+    argv.push_back(nullptr);
+    pid_t pid = -1;
+    if (posix_spawnp(&pid, argv[0], &fa, &at, argv.data(), environ)) pid = -1;
+    posix_spawn_file_actions_destroy(&fa);
+    posix_spawnattr_destroy(&at);
+    if (out_fd) {
+        close(p[1]);
+        if (pid < 0) close(p[0]);
+        else *out_fd = p[0];
+    }
+    return pid;
+}
+void open_with_desktop(const std::string& what) { spawn({"xdg-open", what}, {}, nullptr, true); }
+
+static bool http_get(const std::wstring& url, std::string* body, HANDLE) {  // curl, which every desktop has
+    int fd = -1;
+    pid_t pid = spawn({"curl", "-fsSL", "--max-time", "60", "-H", "Accept: application/vnd.github+json", narrow(url)}, {}, &fd, false);
+    if (pid < 0) return false;
+    char buf[1 << 16];
+    for (ssize_t n; (n = read(fd, buf, sizeof buf)) > 0;)
+        if (body) body->append(buf, (size_t)n);
+    close(fd);
+    int st = 0;
+    waitpid(pid, &st, 0);
+    return WIFEXITED(st) && WEXITSTATUS(st) == 0;
+}
+
+static void delete_old_files() {
+    std::error_code ec;
+    for (auto& e : fs::recursive_directory_iterator(g_dir, ec))
+        if (e.path().extension() == ".old") fs::remove(e.path(), ec);
+}
+
+// Linux: releases are Windows downloads, and an AppImage cannot replace its own files: the Update button opens the
+// release page instead.
+static void apply_update() { ShellExecuteW(g_wnd, L"open", wide(g_rel_page).c_str(), nullptr, nullptr, SW_SHOWNORMAL); }
+#endif
 
 // ------------------------------------------------------------------------------------------------ drawing
+#ifdef _WIN32
 static ID2D1Factory* g_d2d;
 static IDWriteFactory* g_dw;
 static IWICImagingFactory* g_wic;
+#endif
 static ID2D1HwndRenderTarget* g_rt;
 static ID2D1SolidColorBrush* g_brush;
 static ID2D1Bitmap* g_hero;
@@ -439,6 +522,7 @@ static void outline(D2D1_RECT_F r, float rad, D2D1_COLOR_F c, float w = 1) {
     g_brush->SetColor(c);
     g_rt->DrawRoundedRectangle({{r.left + w / 2, r.top + w / 2, r.right - w / 2, r.bottom - w / 2}, rad, rad}, g_brush, w);
 }
+#ifdef _WIN32
 static void text(const std::wstring& s, D2D1_RECT_F r, IDWriteTextFormat* f, D2D1_COLOR_F c,
                  DWRITE_TEXT_ALIGNMENT a = DWRITE_TEXT_ALIGNMENT_LEADING,
                  DWRITE_PARAGRAPH_ALIGNMENT p = DWRITE_PARAGRAPH_ALIGNMENT_CENTER, float spacing = 0) {
@@ -479,6 +563,101 @@ static ID2D1Bitmap* load_bitmap(const fs::path& p) {
     if (dec) dec->Release();
     return bmp;
 }
+#else
+// Linux text: pango with the format's font, wrapped at the box width, aligned like DirectWrite
+static PangoLayout* layout_of(cairo_t* cr, const std::wstring& s, IDWriteTextFormat* f, float w, float spacing) {
+    PangoLayout* l = pango_cairo_create_layout(cr);
+    PangoFontDescription* fd = pango_font_description_from_string(f->family.c_str());
+    pango_font_description_set_absolute_size(fd, f->size * PANGO_SCALE);
+    pango_font_description_set_weight(fd, (PangoWeight)f->weight);
+    if (f->condensed) pango_font_description_set_stretch(fd, PANGO_STRETCH_SEMI_CONDENSED);
+    pango_layout_set_font_description(l, fd);
+    pango_font_description_free(fd);
+    const std::string u = draw::utf8(s);
+    pango_layout_set_text(l, u.c_str(), -1);
+    if (w > 0) pango_layout_set_width(l, (int)(w * PANGO_SCALE)), pango_layout_set_wrap(l, PANGO_WRAP_WORD_CHAR);
+    pango_layout_set_alignment(l, f->align == DWRITE_TEXT_ALIGNMENT_CENTER ? PANGO_ALIGN_CENTER
+                                : f->align == DWRITE_TEXT_ALIGNMENT_TRAILING ? PANGO_ALIGN_RIGHT : PANGO_ALIGN_LEFT);
+    if (spacing != 0) {
+        PangoAttrList* al = pango_attr_list_new();
+        pango_attr_list_insert(al, pango_attr_letter_spacing_new((int)(spacing * PANGO_SCALE)));
+        pango_layout_set_attributes(l, al);
+        pango_attr_list_unref(al);
+    }
+    return l;
+}
+static cairo_t* measure_cr() {  // a context for text sizes outside a paint
+    static cairo_surface_t* s = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, 1, 1);
+    static cairo_t* cr = cairo_create(s);
+    return g_rt && g_rt->cr ? g_rt->cr : cr;
+}
+static void text(const std::wstring& s, D2D1_RECT_F r, IDWriteTextFormat* f, D2D1_COLOR_F c,
+                 DWRITE_TEXT_ALIGNMENT a = DWRITE_TEXT_ALIGNMENT_LEADING,
+                 DWRITE_PARAGRAPH_ALIGNMENT p = DWRITE_PARAGRAPH_ALIGNMENT_CENTER, float spacing = 0) {
+    if (s.empty() || !g_rt || !g_rt->cr) return;
+    f->SetTextAlignment(a);
+    f->SetParagraphAlignment(p);
+    cairo_t* cr = g_rt->cr;
+    PangoLayout* l = layout_of(cr, s, f, r.right - r.left, spacing);
+    PangoRectangle ink, log;
+    pango_layout_get_pixel_extents(l, &ink, &log);
+    const float h = r.bottom - r.top, y = p == DWRITE_PARAGRAPH_ALIGNMENT_NEAR ? r.top
+                                         : p == DWRITE_PARAGRAPH_ALIGNMENT_FAR ? r.bottom - log.height
+                                                                               : r.top + (h - log.height) / 2;
+    cairo_set_source_rgba(cr, c.r, c.g, c.b, c.a);
+    cairo_move_to(cr, r.left, y);
+    pango_cairo_show_layout(cr, l);
+    g_object_unref(l);
+}
+
+static IDWriteTextFormat* font(const wchar_t* family, float size, DWRITE_FONT_WEIGHT w,
+                               DWRITE_FONT_STRETCH st = DWRITE_FONT_STRETCH_NORMAL) {
+    auto* f = new IDWriteTextFormat;
+    // Bahnschrift / Segoe UI are Windows fonts: close relatives first, then the desktop's sans
+    f->family = !wcscmp(family, L"Bahnschrift") ? "Bahnschrift, Barlow Semi Condensed, Barlow, Roboto Condensed, Noto Sans, DejaVu Sans Condensed, Sans"
+                                                : draw::k_ui_font;
+    f->size = size, f->weight = w, f->condensed = st == DWRITE_FONT_STRETCH_CONDENSED;
+    return f;
+}
+
+// PNG (cairo) or the BMPs the game writes (launcher_hero.bmp, F12 screenshots: 24 / 32 bpp, either row order)
+static ID2D1Bitmap* load_bitmap(const fs::path& p) {
+    cairo_surface_t* s = nullptr;
+    const std::string ext = p.extension().string();
+    if (ext == ".png") {
+        s = cairo_image_surface_create_from_png(p.c_str());
+    } else if (ext == ".bmp") {
+        std::ifstream f(p, std::ios::binary);
+        std::string b((std::istreambuf_iterator<char>(f)), {});
+        auto u32 = [&](size_t o) { uint32_t v = 0; if (o + 4 <= b.size()) memcpy(&v, b.data() + o, 4); return v; };
+        auto u16 = [&](size_t o) { uint16_t v = 0; if (o + 2 <= b.size()) memcpy(&v, b.data() + o, 2); return v; };
+        if (b.size() > 54 && b[0] == 'B' && b[1] == 'M') {
+            const uint32_t off = u32(10), w = u32(18), bpp = u16(28);
+            const int32_t hs = (int32_t)u32(22);
+            const uint32_t h = (uint32_t)std::abs(hs), stride = ((w * bpp / 8) + 3) & ~3u;
+            if ((bpp == 24 || bpp == 32) && w && h && w < 16384 && h < 16384 && off + (size_t)stride * h <= b.size()) {
+                s = cairo_image_surface_create(CAIRO_FORMAT_RGB24, (int)w, (int)h);
+                uint8_t* d = cairo_image_surface_get_data(s);
+                const int ds = cairo_image_surface_get_stride(s);
+                for (uint32_t y = 0; y < h; y++) {
+                    const uint8_t* src = (const uint8_t*)b.data() + off + (size_t)stride * (hs < 0 ? y : h - 1 - y);
+                    for (uint32_t x = 0; x < w; x++) {
+                        const uint8_t* q = src + x * (bpp / 8);
+                        uint8_t* o = d + (size_t)y * ds + x * 4;
+                        o[0] = q[0], o[1] = q[1], o[2] = q[2], o[3] = 255;
+                    }
+                }
+                cairo_surface_mark_dirty(s);
+            }
+        }
+    }
+    if (!s) return nullptr;
+    if (cairo_surface_status(s) != CAIRO_STATUS_SUCCESS) { cairo_surface_destroy(s); return nullptr; }
+    auto* bm = new ID2D1Bitmap;
+    bm->s = s;
+    return bm;
+}
+#endif
 
 // Hero picture: <data>/launcher_hero.(png|jpg|bmp), else the newest F12 screenshot, else a drawn stage backdrop.
 static void load_hero() {
@@ -495,6 +674,7 @@ static void load_hero() {
     if (!newest.empty()) g_hero = load_bitmap(newest);
 }
 
+#ifdef _WIN32
 // Window icon (user 11-23): <data>/icon.ico, made from the player's own game: the icon setup took from the NSP
 // (<data>/icon.jpg), else a square of the title screen picture the game saved (launcher_hero.*). Nothing of the game
 // ships with us, so a fresh install shows the default icon until then. tms.exe uses the same file.
@@ -638,6 +818,73 @@ static void draw_hero(D2D1_RECT_F r) {
     fade({0, r.bottom - h * 0.55f}, {0, r.bottom}, {r.left, r.bottom - h * 0.55f, r.right, r.bottom}, 0);
     fade({r.left + 160, 0}, {r.left, 0}, {r.left, r.top, r.left + 160, r.bottom}, 0);
 }
+#else
+// Linux: the window icon comes from the desktop entry / AppImage; nothing to make here
+static void apply_icon() {}
+
+static void draw_hero(D2D1_RECT_F r) {
+    cairo_t* cr = g_rt->cr;
+    float w = r.right - r.left, h = r.bottom - r.top;
+    cairo_save(cr);
+    cairo_rectangle(cr, r.left, r.top, w, h);
+    cairo_clip(cr);
+    if (g_hero) {  // cover: crop the picture to the box's aspect
+        D2D1_SIZE_F s = g_hero->GetSize();
+        float sw = s.width, sh = s.width * h / w;
+        if (sh > s.height) sh = s.height, sw = s.height * w / h;
+        const float sx = (s.width - sw) / 2, sy = (s.height - sh) * 0.15f;
+        cairo_save(cr);
+        cairo_translate(cr, r.left, r.top);
+        cairo_scale(cr, w / sw, h / sh);
+        cairo_set_source_surface(cr, g_hero->s, -sx, -sy);
+        cairo_pattern_set_filter(cairo_get_source(cr), CAIRO_FILTER_GOOD);
+        cairo_paint(cr);
+        cairo_restore(cr);
+    } else {  // two stage spotlights over the ink
+        fill(r, C(0x0d1a14));
+        struct { float x, y, rad; uint32_t c; float a; } spots[] = {{0.72f, 0.15f, 0.75f, ACCENT, 0.55f},
+                                                                    {0.25f, 0.9f, 0.6f, CYAN, 0.28f}};
+        for (auto& sp : spots) {
+            D2D1_COLOR_F c = C(sp.c, sp.a);
+            cairo_pattern_t* pt = cairo_pattern_create_radial(0, 0, 0, 0, 0, 1);
+            cairo_pattern_add_color_stop_rgba(pt, 0, c.r, c.g, c.b, c.a);
+            cairo_pattern_add_color_stop_rgba(pt, 1, c.r, c.g, c.b, 0);
+            cairo_save(cr);
+            cairo_translate(cr, r.left + w * sp.x, r.top + h * sp.y);
+            cairo_scale(cr, w * sp.rad, h * sp.rad * 1.4f);
+            cairo_set_source(cr, pt);
+            cairo_restore(cr);
+            cairo_rectangle(cr, r.left, r.top, w, h);
+            cairo_fill(cr);
+            cairo_pattern_destroy(pt);
+        }
+        cairo_set_source_rgba(cr, 1, 1, 1, 0.035);
+        for (int i = 0; i < 7; i++) {  // faint light beams from the top right
+            float x0 = r.left + w * (0.55f + i * 0.07f);
+            cairo_move_to(cr, x0, r.top);
+            cairo_line_to(cr, x0 + 18, r.top);
+            cairo_line_to(cr, x0 - w * 0.5f + i * 30, r.bottom);
+            cairo_line_to(cr, x0 - w * 0.5f + i * 30 - 70, r.bottom);
+            cairo_close_path(cr);
+            cairo_fill(cr);
+        }
+    }
+    // fade into the page at the bottom and into the sidebar on the left
+    auto fade = [&](D2D1_POINT_2F a, D2D1_POINT_2F b, D2D1_RECT_F box, float from) {
+        D2D1_COLOR_F c = C(BG);
+        cairo_pattern_t* pt = cairo_pattern_create_linear(a.x, a.y, b.x, b.y);
+        cairo_pattern_add_color_stop_rgba(pt, 0, c.r, c.g, c.b, from);
+        cairo_pattern_add_color_stop_rgba(pt, 1, c.r, c.g, c.b, 1);
+        cairo_set_source(cr, pt);
+        cairo_rectangle(cr, box.left, box.top, box.right - box.left, box.bottom - box.top);
+        cairo_fill(cr);
+        cairo_pattern_destroy(pt);
+    };
+    fade({0, r.bottom - h * 0.55f}, {0, r.bottom}, {r.left, r.bottom - h * 0.55f, r.right, r.bottom}, 0);
+    fade({r.left + 160, 0}, {r.left, 0}, {r.left, r.top, r.left + 160, r.bottom}, 0);
+    cairo_restore(cr);
+}
+#endif
 
 // ------------------------------------------------------------------------------------------------ hit targets
 struct Hit { D2D1_RECT_F r; int id; std::function<void(float x)> click; };
@@ -732,6 +979,7 @@ static void control(int i, D2D1_RECT_F r) {
 }
 
 // A settings row: name, help text under it, control on the right. Returns the row height.
+#ifdef _WIN32
 static float text_h(const std::wstring& s, IDWriteTextFormat* f, float w) {
     IDWriteTextLayout* l = nullptr;
     DWRITE_TEXT_METRICS m{};
@@ -746,6 +994,24 @@ static float text_w(const std::wstring& s, IDWriteTextFormat* f) {
     if (SUCCEEDED(g_dw->CreateTextLayout(s.c_str(), (UINT32)s.size(), f, 4000, 100, &l))) l->GetMetrics(&m), l->Release();
     return m.widthIncludingTrailingWhitespace;
 }
+#else
+static float text_h(const std::wstring& s, IDWriteTextFormat* f, float w) {
+    if (s.empty()) return 0;
+    PangoLayout* l = layout_of(measure_cr(), s, f, w, 0);
+    int lw, lh;
+    pango_layout_get_pixel_size(l, &lw, &lh);
+    g_object_unref(l);
+    return (float)lh;
+}
+static float text_w(const std::wstring& s, IDWriteTextFormat* f) {
+    f->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+    PangoLayout* l = layout_of(measure_cr(), s, f, 0, 0);
+    int lw, lh;
+    pango_layout_get_pixel_size(l, &lw, &lh);
+    g_object_unref(l);
+    return (float)lw;
+}
+#endif
 
 // A settings row: name, help text under it (and an optional value line in green), control on the right. The row is
 // as tall as its text. Returns the row height.
@@ -885,6 +1151,10 @@ static void draw_sidebar() {
         if (u == UPD_BUSY) text(L"Downloading and installing…", R(b.left + 16, b.top + 40, 200, 20), f_small, C(MUTED));
         else {
             button(R(b.left + 16, b.top + 44, 92, 34), L"Update", ID_UPDATE, true, [] {
+#ifndef _WIN32
+                apply_update();  // Linux: the release page
+                return;
+#endif
                 std::wstring q = L"Download and install " + wide(g_rel_tag) + L" from github.com/" + wide(repo()) +
                                  L"?\n\nSettings, saves and mods stay as they are.";
                 if (MessageBoxW(g_wnd, q.c_str(), L"Update TMSRecomp", MB_YESNO | MB_ICONQUESTION) == IDYES) apply_update();
@@ -933,7 +1203,14 @@ static int g_topic = 0;  // Guide topic (the Setup page's Extras tiles open one)
 static int g_su_topic = -1;       // the Guide topic that install belongs to (its status shows only there)
 static DWORD g_su_t0;
 
+#ifdef _WIN32
 static bool game_ready() { return is_data(g_data) && fs::exists(g_dir / "game.dll"); }
+#else
+static bool game_ready() {  // game.so next to tms, or where NX_GAME_SO points (a build outside a read-only install)
+    const char* e = getenv("NX_GAME_SO");
+    return is_data(g_data) && (fs::exists(g_dir / "game.so") || (e && *e && fs::exists(e)));
+}
+#endif
 
 // What game.dll and the shader cache were built with: tms.exe (its exports), setup\sdk, setup\tools, setup\llvm and the
 // shader translator. A finished setup stores this in setup\built.txt; after an update it differs -> setup runs again
@@ -946,7 +1223,11 @@ static std::string build_signature() {
         auto t = fs::last_write_time(p, ec).time_since_epoch().count();
         v.push_back(fs::relative(p, g_dir, ec).string() + "|" + std::to_string(fs::file_size(p, ec)) + "|" + std::to_string(t));
     };
+#ifdef _WIN32
     add(g_dir / "tms.exe");
+#else
+    add(g_dir / "tms");
+#endif
     add(g_dir / "shaderc" / "NxShader.dll");
     for (const char* d : {"sdk", "tools", "llvm"})
         for (auto it = fs::recursive_directory_iterator(g_dir / "setup" / d, ec); it != fs::recursive_directory_iterator(); it.increment(ec)) {
@@ -986,6 +1267,7 @@ static void su_line(const std::string& l) {
     }
 }
 
+#ifdef _WIN32
 static void su_reader(HANDLE out) {
     std::string buf;
     char b[4096];
@@ -1095,6 +1377,133 @@ static std::wstring pick_folder(const wchar_t* title) {
     d->Release();
     return r;
 }
+#else
+static pid_t g_su_pid = -1;
+static void su_reader(int fd) {
+    std::string buf;
+    char b[4096];
+    for (ssize_t n; (n = read(fd, b, sizeof b)) > 0;) {
+        buf.append(b, (size_t)n);
+        for (size_t e; (e = buf.find('\n')) != std::string::npos; buf.erase(0, e + 1)) {
+            su_line(trim(buf.substr(0, e)));
+            PostMessageW(g_wnd, WM_SETUP, 0, 0);
+        }
+    }
+    close(fd);
+    {
+        std::lock_guard<std::mutex> lk(g_su_lock);
+        g_su.running = false;
+        if (!g_su.done && g_su.error.empty()) g_su.error = L"Setup stopped.";
+    }
+    PostMessageW(g_wnd, WM_SETUP, 1, 0);
+}
+
+// The setup script: setup/tools/setup/setup.py next to the launcher (a release), else the source tree's tools/ above a
+// build folder. Python: setup/python/bin/python3 when shipped, else python3 from the system.
+static fs::path setup_script() {
+    for (const fs::path& p : {g_dir / "setup" / "tools" / "setup" / "setup.py", g_dir.parent_path() / "tools" / "setup" / "setup.py"})
+        if (fs::exists(p)) return p;
+    return {};
+}
+// extra: setup.py arguments of a Guide page install (--mod / --zip / --music "<path>"), into the data folder
+static void su_start(bool dlss_only = false, const std::wstring& extra = L"") {
+    const fs::path script = setup_script(), py = g_dir / "setup" / "python" / "bin" / "python3";
+    if (script.empty()) {
+        MessageBoxW(g_wnd, L"The setup tools (setup/ folder) are missing: unpack the whole TMSRecomp download again.",
+                    L"TMSRecomp", MB_ICONERROR);
+        return;
+    }
+    if (dlss_only) return;  // no DLSS download on Linux
+    if (extra.empty() && (g_su_src.empty() || (su_is_nsp() && (g_su_keys.empty() || g_su_target.empty())))) {
+        MessageBoxW(g_wnd, L"Pick your game (NSP file, or a folder with exefs and romfs), and for an NSP your prod.keys.",
+                    L"TMSRecomp", MB_ICONWARNING);
+        return;
+    }
+    std::vector<std::string> a = {fs::exists(py) ? py.string() : "python3", "-I", "-u", script.string(), "--install", g_dir.string()};
+    if (!extra.empty()) {  // "--flag \"path\""
+        const std::string e = narrow(extra);
+        const size_t q0 = e.find('"'), q1 = e.rfind('"');
+        a.push_back(e.substr(0, e.find(' ')));
+        a.push_back(q0 != std::string::npos && q1 > q0 ? e.substr(q0 + 1, q1 - q0 - 1) : e.substr(e.find(' ') + 1));
+        a.insert(a.end(), {"--data", g_data.string()});
+    } else {
+        if (su_is_nsp()) a.insert(a.end(), {"--nsp", narrow(g_su_src), "--keys", narrow(g_su_keys), "--data", narrow(g_su_target)});
+        else a.insert(a.end(), {"--folder", narrow(g_su_src)});
+        if (!g_su_shaders) a.push_back("--no-shaders");
+    }
+    int fd = -1;
+    g_su_pid = spawn(a, g_dir, &fd, true);
+    if (g_su_pid < 0) {
+        MessageBoxW(g_wnd, L"Could not start the setup (python3).", L"TMSRecomp", MB_ICONERROR);
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_su_lock);
+        g_su = {};
+        g_su.running = true, g_su.text = L"Starting…";
+    }
+    g_su_extra = !extra.empty();
+    g_su_topic = g_page == 7 ? g_topic : 1;  // the Mods page installs the patch
+    g_su_t0 = GetTickCount();
+    std::thread(su_reader, fd).detach();
+}
+
+static void su_cancel() {
+    if (g_su_pid > 0) kill(-g_su_pid, SIGTERM);  // the whole group: python and every tool it started
+}
+
+// File pickers: the desktop's own dialogs through SDL (portal or zenity), waited for here
+struct DlgState { bool done = false; std::string path; std::vector<std::string> names, patterns; };
+static void dlg_done(void* ud, const char* const* list, int) {
+    auto* s = (DlgState*)ud;
+    if (list && list[0]) s->path = list[0];
+    s->done = true;
+}
+static std::wstring run_dialog(SDL_FileDialogType type, DlgState& st, const wchar_t* title, const std::vector<SDL_DialogFileFilter>& filters) {
+    SDL_PropertiesID p = SDL_CreateProperties();
+    SDL_SetPointerProperty(p, SDL_PROP_FILE_DIALOG_WINDOW_POINTER, g_wnd);
+    const std::string t = narrow(title);
+    SDL_SetStringProperty(p, SDL_PROP_FILE_DIALOG_TITLE_STRING, t.c_str());
+    if (!filters.empty()) {
+        SDL_SetPointerProperty(p, SDL_PROP_FILE_DIALOG_FILTERS_POINTER, (void*)filters.data());
+        SDL_SetNumberProperty(p, SDL_PROP_FILE_DIALOG_NFILTERS_NUMBER, (Sint64)filters.size());
+    }
+    SDL_ShowFileDialogWithProperties(type, dlg_done, &st, p);
+    while (!st.done) {
+        SDL_Event e;
+        SDL_WaitEventTimeout(&e, 50);  // the dialog answers through the event queue
+    }
+    SDL_DestroyProperties(p);
+    g_need_redraw = true;
+    return wide(st.path);
+}
+static std::wstring pick_file(const wchar_t* filter, const wchar_t* title) {
+    DlgState st;
+    for (const wchar_t* f = filter; *f;) {  // "Name\0*.ext;*.x\0..." pairs -> SDL's "ext;x"
+        std::string name = narrow(f);
+        f += wcslen(f) + 1;
+        std::string pat = narrow(f), sdl;
+        f += wcslen(f) + 1;
+        for (size_t a = 0; a <= pat.size();) {
+            size_t b = pat.find(';', a);
+            if (b == std::string::npos) b = pat.size();
+            std::string one = pat.substr(a, b - a);
+            if (one.rfind("*.", 0) == 0) one = one.substr(2);
+            if (one == "*") one = "*";
+            sdl += (sdl.empty() ? "" : ";") + one;
+            a = b + 1;
+        }
+        st.names.push_back(name), st.patterns.push_back(sdl);
+    }
+    std::vector<SDL_DialogFileFilter> filters;
+    for (size_t k = 0; k < st.names.size(); k++) filters.push_back({st.names[k].c_str(), st.patterns[k].c_str()});
+    return run_dialog(SDL_FILEDIALOG_OPENFILE, st, title, filters);
+}
+static std::wstring pick_folder(const wchar_t* title) {
+    DlgState st;
+    return run_dialog(SDL_FILEDIALOG_OPENFOLDER, st, title, {});
+}
+#endif
 
 
 // Shortened path for a value line: the end matters most.
@@ -1190,6 +1599,7 @@ static void draw_setup(float x, float w) {
     y += row_with(L"Precompile shaders", L"No stutter the first time an effect appears in the game. Adds about 4 minutes and "
                                          L"300 MB to the setup.",
                   x, y, w, [&](D2D1_RECT_F r) { toggle(r, g_su_shaders, ID_SU_SHADERS, [] { g_su_shaders = !g_su_shaders; }, idle); });
+#ifdef _WIN32
     const bool have_dlss = fs::exists(g_dir / "nvngx_dlss.dll");
     y += row_with(L"NVIDIA DLSS",
                   have_dlss ? L"Installed. Turn it on under Display & FPS \u2192 Anti-aliasing (RTX graphics cards)."
@@ -1200,6 +1610,7 @@ static void draw_setup(float x, float w) {
                       if (idle && !have_dlss && g_su_dlss && game_ready())
                           button(R(r.right - 150, r.top, 150, 40), L"Download now", ID_SU_DLSS_RUN, true, [] { su_start(true); });
                   });
+#endif
 
     y += 18;
     if (idle && game_ready()) {
@@ -1232,6 +1643,7 @@ static void draw_setup(float x, float w) {
 
 // "Copy system info": one block for a bug report (version, Windows, CPU, RAM, GPU + driver from the last nx.log, the
 // settings that change rendering). Paths are left out (they hold the Windows user name).
+#ifdef _WIN32
 static void copy_sysinfo() {
     std::string t = sysinfo_line() + "\r\n";
     std::ifstream lf(g_data / "nx.log");
@@ -1261,6 +1673,24 @@ static void copy_sysinfo() {
     CloseClipboard();
     MessageBoxW(g_wnd, (L"Copied. Paste it into your bug report, and attach nx.log.\n\n" + w).c_str(), L"System info", MB_ICONINFORMATION);
 }
+#else
+static void copy_sysinfo() {
+    std::string t = sysinfo_line() + "\n";
+    std::ifstream lf(g_data / "nx.log");
+    std::string gpu;
+    for (std::string l; gpu.empty() && std::getline(lf, l);)
+        if (auto k = l.find("vk: "); k != std::string::npos && l.find("(driver") != std::string::npos) gpu = trim(l.substr(k + 4));
+    t += "GPU: " + (gpu.empty() ? std::string("unknown (start the game once)") : gpu) + "\nSettings:";
+    for (const char* k : {"fps", "res", "window", "present_mode", "fx_fxaa", "fsr3_quality", "dlss_preset", "msaa", "upscaler", "tex_pack",
+                          "movie_hd", "mods_disabled", "random_battle_bgm"})
+        if (auto v = get(k, ""); !v.empty()) t += std::string(" ") + k + "=" + v;
+    int on = 0;
+    for (auto& m : g_mods) on += m.on;
+    t += " mods_on=" + std::to_string(on) + "\n";
+    SDL_SetClipboardText(t.c_str());
+    MessageBoxW(g_wnd, (L"Copied. Paste it into your bug report, and attach nx.log.\n\n" + wide(t)).c_str(), L"System info", MB_ICONINFORMATION);
+}
+#endif
 
 // ------------------------------------------------------------------------------------------------ Guide page
 // First-time help: one topic at a time, numbered steps and the buttons that do them (installs run setup.py --mod /
@@ -1598,6 +2028,7 @@ static void draw_page_body() {
     }
 }
 
+#ifdef _WIN32
 static void paint() {
     if (!g_rt) return;
     g_hits.clear();
@@ -1624,6 +2055,49 @@ static void create_target() {
     g_rt->CreateSolidColorBrush(C(TEXT), &g_brush);
     load_hero();
 }
+#else
+static bool g_launched = false;  // PLAY started the game: close
+// Linux: the page drawn with cairo at the window's pixel size into an SDL texture
+static SDL_Renderer* g_ren;
+static SDL_Texture* g_tex;
+static cairo_surface_t* g_surf;
+static void paint() {
+    if (!g_rt || !g_ren) return;
+    int pw = 0, ph = 0;
+    SDL_GetWindowSizeInPixels(g_wnd, &pw, &ph);
+    if (pw <= 0 || ph <= 0) return;
+    if (!g_surf || cairo_image_surface_get_width(g_surf) != pw || cairo_image_surface_get_height(g_surf) != ph) {
+        if (g_surf) cairo_surface_destroy(g_surf);
+        if (g_tex) SDL_DestroyTexture(g_tex);
+        g_surf = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, pw, ph);
+        g_tex = SDL_CreateTexture(g_ren, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, pw, ph);
+    }
+    g_hits.clear();
+    cairo_t* cr = cairo_create(g_surf);
+    cairo_scale(cr, pw / W, ph / H);
+    g_rt->cr = cr, g_rt->tx = g_rt->ty = 0;
+    D2D1_COLOR_F bg = C(BG);
+    cairo_set_source_rgb(cr, bg.r, bg.g, bg.b);
+    cairo_paint(cr);
+    draw_page();
+    draw_sidebar();
+    draw_footer();
+    popup();
+    cairo_destroy(cr);
+    g_rt->cr = nullptr;
+    cairo_surface_flush(g_surf);
+    SDL_UpdateTexture(g_tex, nullptr, cairo_image_surface_get_data(g_surf), cairo_image_surface_get_stride(g_surf));
+    SDL_RenderClear(g_ren);
+    SDL_RenderTexture(g_ren, g_tex, nullptr, nullptr);
+    SDL_RenderPresent(g_ren);
+}
+
+static void create_target() {
+    g_rt = new ID2D1HwndRenderTarget;
+    g_brush = new ID2D1SolidColorBrush;
+    load_hero();
+}
+#endif
 
 // ------------------------------------------------------------------------------------------------ actions
 static void browse() {
@@ -1650,6 +2124,7 @@ static void play() {
         MessageBoxW(g_wnd, (L"Could not write " + g_ini.wstring()).c_str(), L"TMSRecomp", MB_ICONERROR);
         return;
     }
+#ifdef _WIN32
     std::wstring exe = (g_dir / "tms.exe").wstring(), dir = g_dir.wstring();
     STARTUPINFOW si{sizeof si};
     PROCESS_INFORMATION pi;
@@ -1661,6 +2136,15 @@ static void play() {
     CloseHandle(pi.hProcess);
     DestroyWindow(g_wnd);
 }
+#else
+    // the game in its own session, so it keeps running when the launcher closes
+    if (spawn({(g_dir / "tms").string()}, g_dir, nullptr, true) < 0) {
+        MessageBoxW(g_wnd, (L"Could not start " + (g_dir / "tms").wstring()).c_str(), L"TMSRecomp", MB_ICONERROR);
+        return;
+    }
+    g_launched = true;  // the window loop closes the launcher without questions
+}
+#endif
 
 static int hit_at(float x, float y) {
     for (size_t k = g_hits.size(); k-- > 0;)  // last drawn (popup) first
@@ -1668,6 +2152,7 @@ static int hit_at(float x, float y) {
     return -1;
 }
 
+#ifdef _WIN32
 static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
     switch (m) {
     case WM_PAINT: {
@@ -1849,3 +2334,157 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmd, int show) {
     }
     return 0;
 }
+#else
+// Linux window loop: SDL events in place of the window messages above
+static bool close_requested() {  // WM_CLOSE: true = close
+    if (g_su.running && MessageBoxW(g_wnd, L"Setup is still running. Stop it and close?", L"TMSRecomp",
+                                    MB_YESNO | MB_ICONQUESTION) != IDYES)
+        return false;
+    su_cancel();
+    if (g_dirty) {
+        int r = MessageBoxW(g_wnd, L"Save the changed settings?", L"TMSRecomp", MB_YESNOCANCEL | MB_ICONQUESTION);
+        if (r == IDCANCEL) return false;
+        if (r == IDYES) save();
+    }
+    return true;
+}
+
+int main(int argc, char** argv) {
+    bool page_given = false;
+    std::vector<std::string> setup_args;
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--page") && i + 1 < argc) g_page = std::clamp(atoi(argv[++i]), 0, (int)std::size(k_pages) - 1), page_given = true;
+        else if (!strcmp(argv[i], "--topic") && i + 1 < argc) g_topic = std::clamp(atoi(argv[++i]), 0, (int)std::size(k_topics) - 1);
+        else if (!strcmp(argv[i], "--setup")) while (i + 1 < argc) setup_args.push_back(argv[++i]);
+    }
+    try { std::locale::global(std::locale("C.UTF-8")); } catch (...) {}  // UTF-8 file names in fs::path
+    g_dir = plat::exe_path().parent_path();
+    g_ini = plat::settings_ini();  // the same file tms reads
+    load();
+    if (!game_ready() && !page_given) g_page = 6;  // first start: build the game from the player's files
+    delete_old_files();
+    scan_mods();
+    SDL_SetHint(SDL_HINT_APP_ID, "TMSRecomp");
+    if (!SDL_Init(SDL_INIT_VIDEO)) { fprintf(stderr, "launcher: SDL_Init: %s\n", SDL_GetError()); return 1; }
+    g_user_event = SDL_RegisterEvents(1);
+    const auto bold = DWRITE_FONT_WEIGHT_BOLD, semi = DWRITE_FONT_WEIGHT_SEMI_BOLD, reg = DWRITE_FONT_WEIGHT_NORMAL;
+    const auto cond = DWRITE_FONT_STRETCH_CONDENSED;
+    f_brand = font(L"Bahnschrift", 27, bold, cond);
+    f_brand2 = font(L"Bahnschrift", 14, semi, cond);
+    f_nav = font(L"Bahnschrift", 17, reg);
+    f_h1 = font(L"Bahnschrift", 36, semi, cond);
+    f_caps = font(L"Bahnschrift", 12.5f, semi);
+    f_h2 = font(L"Bahnschrift", 24, semi, cond);
+    f_label = font(L"Segoe UI", 15, reg);
+    f_body = font(L"Segoe UI", 15, reg);
+    f_small = font(L"Segoe UI", 12.5f, reg);
+    f_btn = font(L"Segoe UI", 14, semi);
+    f_play = font(L"Bahnschrift", 26, bold, cond);
+    g_wnd = SDL_CreateWindow("Tokyo Mirage Sessions ♯FE Encore · TMSRecomp", (int)W, (int)H, SDL_WINDOW_HIGH_PIXEL_DENSITY);
+    if (!g_wnd) { fprintf(stderr, "launcher: SDL_CreateWindow: %s\n", SDL_GetError()); return 1; }
+    g_ren = SDL_CreateRenderer(g_wnd, nullptr);
+    if (!g_ren) { fprintf(stderr, "launcher: SDL_CreateRenderer: %s\n", SDL_GetError()); return 1; }
+    SDL_SetRenderVSync(g_ren, 1);
+    create_target();
+    SDL_Cursor* hand = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_POINTER);
+    SDL_Cursor* arrow = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_DEFAULT);
+    check_updates();
+    if (!setup_args.empty()) {  // --setup <extracted folder | nsp> [keys target]: start at once
+        g_su_src = wide(setup_args[0]);
+        if (setup_args.size() > 2) g_su_keys = wide(setup_args[1]), g_su_target = wide(setup_args[2]);
+        g_page = 6;
+        su_start();
+    } else if (setup_stale()) {  // after an update: rebuild game.so from the same game files (incremental)
+        g_su_src = g_data.wstring();
+        g_page = 6;
+        su_start();
+    }
+    for (bool quit = false; !quit;) {
+        SDL_Event e;
+        bool got = SDL_WaitEventTimeout(&e, g_su.running ? 250 : 1000);
+        if (g_su.running) g_need_redraw = true;  // the progress clock
+        for (; got; got = SDL_PollEvent(&e)) {
+            switch (e.type) {
+            case SDL_EVENT_QUIT:
+            case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
+                if (close_requested()) quit = true;
+                break;
+            case SDL_EVENT_WINDOW_EXPOSED:
+            case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
+            case SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED: g_need_redraw = true; break;
+            case SDL_EVENT_WINDOW_MOUSE_LEAVE: g_hover = -1, g_need_redraw = true; break;
+            case SDL_EVENT_WINDOW_FOCUS_GAINED:  // back from the game: its first start saves the title screen picture
+                if (g_rt && !g_hero_title && !g_data.empty()) {
+                    std::error_code ec;
+                    for (const wchar_t* n : {L"launcher_hero.png", L"launcher_hero.jpg", L"launcher_hero.bmp"})
+                        if (fs::exists(g_data / n, ec)) { load_hero(), g_need_redraw = true; break; }
+                }
+                break;
+            case SDL_EVENT_MOUSE_MOTION: {
+                float x = e.motion.x, y = e.motion.y;
+                if (g_drag >= 0) {
+                    const Setting& s = k_set[g_drag];
+                    float k = std::clamp((x - g_drag_track.left) / (g_drag_track.right - g_drag_track.left), 0.f, 1.f);
+                    char b[16];
+                    snprintf(b, 16, "%.1f", s.lo + std::round(k * (s.hi - s.lo) / s.step) * s.step);
+                    if (value_of(g_drag) != b) set(s.key, b), g_need_redraw = true;
+                    break;
+                }
+                int k = hit_at(x, y), id = k >= 0 ? g_hits[k].id : -1;
+                SDL_SetCursor(id >= 0 ? hand : arrow);
+                if (id != g_hover) g_hover = id, g_need_redraw = true;
+                break;
+            }
+            case SDL_EVENT_MOUSE_WHEEL:
+                if (g_max_scroll > 0) {
+                    float& sc = g_scroll[g_page];
+                    sc = std::clamp(sc - e.wheel.y * 60, 0.f, g_max_scroll);
+                    g_open = -1, g_hover = -1, g_need_redraw = true;
+                }
+                break;
+            case SDL_EVENT_MOUSE_BUTTON_DOWN: {
+                if (e.button.button != SDL_BUTTON_LEFT) break;
+                int k = hit_at(e.button.x, e.button.y);
+                bool was_open = g_open >= 0;
+                if (k >= 0) {
+                    int id = g_hits[k].id;
+                    if (was_open && id != ID_SET + g_open && (id < ID_POP || id >= ID_MOD)) g_open = -1;
+                    auto f = g_hits[k].click;  // the hit list is rebuilt by the redraw
+                    f(e.button.x);
+                } else g_open = -1;
+                g_need_redraw = true;
+                break;
+            }
+            case SDL_EVENT_MOUSE_BUTTON_UP:
+                if (e.button.button == SDL_BUTTON_LEFT && g_drag >= 0) g_drag = -1, ReleaseCapture(), g_need_redraw = true;
+                break;
+            case SDL_EVENT_KEY_DOWN:
+                if (e.key.key == SDLK_ESCAPE && g_open >= 0) g_open = -1, g_need_redraw = true;
+                else if (e.key.key == SDLK_RETURN && g_open < 0) play();
+                break;
+            default:
+                if (e.type == g_user_event) {
+                    if (e.user.code == (Sint32)WM_SETUP && (uintptr_t)e.user.data1 == 1) {
+                        if (g_su.done && g_su_extra) scan_mods();  // a Guide install: nothing of the build changed
+                        else if (g_su.done && is_data(g_data)) {  // finished: remember the data folder and the build inputs
+                            std::error_code ec;
+                            fs::create_directories(built_file().parent_path(), ec);
+                            std::ofstream(built_file(), std::ios::binary) << build_signature();
+                            set("data", narrow(g_data.wstring()));
+                            save();
+                            scan_mods();
+                            load_hero();
+                        }
+                    }
+                    g_need_redraw = true;
+                }
+            }
+        }
+        if (g_launched) quit = true;
+        while (waitpid(-1, nullptr, WNOHANG) > 0) {}  // finished helpers (xdg-open, curl, setup)
+        if (g_need_redraw && !quit) g_need_redraw = false, paint();
+    }
+    SDL_Quit();
+    return 0;
+}
+#endif

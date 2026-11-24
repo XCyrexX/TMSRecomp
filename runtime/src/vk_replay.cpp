@@ -1,7 +1,7 @@
 // Replay of recorded NVN commands into a Vulkan command buffer: render targets, clears, copies, draws.
 // State encodings (bit positions) come from the SDK's NVN state setters (NOTES.md "NVN"); enum orders that are
 // still assumptions are marked "assumed" and need checking on screen.
-#include <windows.h>
+#include "plat.h"
 
 #include <algorithm>
 #include <chrono>

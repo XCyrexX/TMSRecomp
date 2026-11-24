@@ -1,5 +1,9 @@
 // Guest address -> recompiled function, HLE hooks bound by symbol name, traps raised by generated code.
-#include <windows.h>
+#include "plat.h"
+#ifndef _WIN32
+#include <dlfcn.h>
+#include <shared_mutex>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -31,6 +35,7 @@ const GuestModule* g_modules;
 uint32_t g_module_count, g_image_size;
 
 void game_load(const std::filesystem::path& dir) {
+#ifdef _WIN32
     auto p = dir / "game.dll";
     HMODULE m = LoadLibraryW(p.c_str());
     if (!m) fatal("cannot load %s (error %lu): run Setup in launcher.exe to build it from your game files",
@@ -40,6 +45,18 @@ void game_load(const std::filesystem::path& dir) {
         if (!a) fatal("game.dll has no %s: rebuild it (Setup in launcher.exe)", n);
         return a;
     };
+#else
+    // game.so: next to tms, or NX_GAME_SO (a build kept outside a read-only install, e.g. an AppImage)
+    std::filesystem::path p = getenv("NX_GAME_SO") ? std::filesystem::path(getenv("NX_GAME_SO")) : dir / "game.so";
+    void* m = dlopen(p.c_str(), RTLD_NOW | RTLD_LOCAL);
+    if (!m) fatal("cannot load %s (%s): run the setup (tools/setup/setup.py) to build it from your game files",
+                  p.string().c_str(), dlerror());
+    auto sym = [&](const char* n) {
+        void* a = dlsym(m, n);
+        if (!a) fatal("game.so has no %s: rebuild it (tools/setup/setup.py)", n);
+        return a;
+    };
+#endif
     g_guest_funcs = (const GuestFunc*)sym("g_guest_funcs");
     g_guest_func_count = *(const uint32_t*)sym("g_guest_func_count");
     g_hook_names = (const GuestHookName*)sym("g_hook_names");
@@ -253,15 +270,29 @@ extern "C" void cp15_write(Cpu* c, int opc1, int crn, int crm, int opc2, uint32_
 }
 
 static uint64_t real_counter() {
+#ifdef _WIN32
     static LARGE_INTEGER freq = [] { LARGE_INTEGER f; QueryPerformanceFrequency(&f); return f; }();
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
     uint64_t q = (uint64_t)now.QuadPart, f = (uint64_t)freq.QuadPart;
+#else
+    timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    uint64_t q = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec, f = 1000000000ull;
+#endif
     return q / f * 19200000 + q % f * 19200000 / f;
 }
 
 // guest time = base_guest + (real - base_real) * speed; rebased on every speed change so it never jumps back
+#ifdef _WIN32
 static SRWLOCK g_speed_lock = SRWLOCK_INIT;
+#else
+static std::shared_mutex g_speed_lock;
+static void AcquireSRWLockExclusive(std::shared_mutex* m) { m->lock(); }
+static void ReleaseSRWLockExclusive(std::shared_mutex* m) { m->unlock(); }
+static void AcquireSRWLockShared(std::shared_mutex* m) { m->lock_shared(); }
+static void ReleaseSRWLockShared(std::shared_mutex* m) { m->unlock_shared(); }
+#endif
 static uint64_t g_base_real = 0, g_base_guest = 0;
 std::atomic<int> rt::g_speed{[] { const char* s = getenv("NX_SPEED"); return s && atoi(s) > 1 ? atoi(s) : 1; }()};
 

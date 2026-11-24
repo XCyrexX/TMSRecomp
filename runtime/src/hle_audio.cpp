@@ -1,7 +1,7 @@
 // nn::audio AudioOut on an SDL3 audio stream. Buffers are released (and the game's event signalled) once SDL has
 // consumed them, so the game's audio thread is paced by real playback like on the console.
 #include <SDL3/SDL.h>
-#include <windows.h>
+#include "plat.h"
 
 #include <cmath>
 #include <deque>

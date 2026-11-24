@@ -1,7 +1,12 @@
 // nn::fs on host files: "rom:" -> <data>/romfs, save mounts -> <data>/save. Positional Win32 reads (thread-safe).
 // Mods (LayeredFS style): a file at <data>/mods/<name>/romfs/<path> replaces romfs/<path>. Every mod folder is on
 // unless named in NX_MODS_DISABLED (ini mods_disabled, comma separated); earlier names (sorted) win.
-#include <windows.h>
+#include "plat.h"
+#ifndef _WIN32
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <filesystem>
@@ -15,7 +20,36 @@ constexpr uint32_t RES_PATH_NOT_FOUND = 0x202, RES_PATH_EXISTS = 0x402, RES_FAIL
 
 static std::mutex g_fs_lock;
 static std::unordered_map<std::string, std::vector<fs::path>> g_mounts;  // roots, first existing file wins
-static std::unordered_map<uint32_t, HANDLE> g_files;
+#ifdef _WIN32
+using FileH = HANDLE;
+static const FileH k_bad_file = INVALID_HANDLE_VALUE;
+#else
+// Linux: file descriptors, positional reads and writes (pread / pwrite: thread-safe like the OVERLAPPED reads)
+using FileH = int;
+static const FileH k_bad_file = -1;
+using DWORD = uint32_t;
+static constexpr DWORD GENERIC_READ = 1, GENERIC_WRITE = 2;
+static FileH f_open(const fs::path& p, DWORD access) {
+    return open(p.c_str(), (access & GENERIC_WRITE ? (access & GENERIC_READ ? O_RDWR : O_WRONLY) : O_RDONLY) | O_CLOEXEC);
+}
+// Windows paths ignore case, the game's own paths may not match the dumped names letter for letter: a component that
+// does not exist is looked up case-insensitively in its folder (only on a miss, so normal opens cost nothing extra).
+static fs::path ci_path(const fs::path& root, const fs::path& rel) {
+    fs::path cur = root;
+    std::error_code ec;
+    for (auto it = rel.begin(); it != rel.end(); ++it) {
+        fs::path next = cur / *it;
+        if (!fs::exists(next, ec)) {
+            const std::string want = it->string();
+            for (auto& e : fs::directory_iterator(cur, ec))
+                if (!strcasecmp(e.path().filename().c_str(), want.c_str())) { next = e.path(); break; }
+        }
+        cur = next;
+    }
+    return cur;
+}
+#endif
+static std::unordered_map<uint32_t, FileH> g_files;
 struct Dir { std::vector<fs::directory_entry> ents; size_t pos = 0; };
 static std::unordered_map<uint32_t, Dir> g_dirs;
 static uint32_t g_next = 1;
@@ -31,9 +65,15 @@ static bool host_path(uint32_t gpath, fs::path& out) {
     while (!rest.empty() && rest[0] == '/') rest.erase(0, 1);
     fs::path rel = fs::u8path(rest);
     std::error_code ec;
+#ifdef _WIN32
     for (size_t i = 0; i + 1 < it->second.size(); i++)
         if (fs::is_regular_file(it->second[i] / rel, ec)) { out = it->second[i] / rel; return true; }
     out = it->second.back() / rel;
+#else
+    for (size_t i = 0; i + 1 < it->second.size(); i++)
+        if (fs::path q = ci_path(it->second[i], rel); fs::is_regular_file(q, ec)) { out = q; return true; }
+    out = ci_path(it->second.back(), rel);
+#endif
     return true;
 }
 
@@ -90,8 +130,12 @@ HLE_FN(fs_OpenFile, "_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci") {
     if (!host_path(c->r[1], p)) { c->r[0] = RES_PATH_NOT_FOUND; return; }
     uint32_t mode = c->r[2];
     DWORD access = (mode & 1 ? GENERIC_READ : 0) | (mode & 6 ? GENERIC_WRITE : 0);
+#ifdef _WIN32
     HANDLE h = CreateFileW(p.c_str(), access, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
-    if (h == INVALID_HANDLE_VALUE) {
+#else
+    FileH h = f_open(p, access);
+#endif
+    if (h == k_bad_file) {
         LOGV("fs: open %s: not found", p.string().c_str());
         c->r[0] = RES_PATH_NOT_FOUND;
         return;
@@ -103,14 +147,35 @@ HLE_FN(fs_OpenFile, "_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci") {
     LOGV("fs: open %s -> %u", p.string().c_str(), id);
     c->r[0] = 0;
 }
-static HANDLE file(uint32_t id) {
+static FileH file(uint32_t id) {
     std::lock_guard<std::mutex> l(g_fs_lock);
     auto it = g_files.find(id);
-    return it == g_files.end() ? INVALID_HANDLE_VALUE : it->second;
+    return it == g_files.end() ? k_bad_file : it->second;
 }
 static uint32_t do_read(uint32_t id, uint64_t off, uint32_t buf, uint32_t size, uint32_t* got) {
-    HANDLE h = file(id);
-    if (h == INVALID_HANDLE_VALUE) return RES_FAIL;
+    FileH h = file(id);
+    if (h == k_bad_file) return RES_FAIL;
+#ifndef _WIN32
+    // straight into guest memory; a write-watched page (memory.cpp) makes the kernel return EFAULT instead of
+    // faulting, so the rest then goes through a bounce buffer (written by the CPU: the watch sees it)
+    uint32_t n = 0;
+    while (n < size) {
+        ssize_t r = pread(h, GPTR(buf + n), size - n, (off_t)(off + n));
+        if (r > 0) { n += (uint32_t)r; continue; }
+        if (r == 0) break;
+        if (errno == EINTR) continue;
+        if (errno != EFAULT) return RES_FAIL;
+        std::vector<uint8_t> tmp(std::min<uint32_t>(size - n, 4u << 20));
+        r = pread(h, tmp.data(), tmp.size(), (off_t)(off + n));
+        if (r < 0) return RES_FAIL;
+        if (r == 0) break;
+        memcpy(GPTR(buf + n), tmp.data(), (size_t)r);
+        n += (uint32_t)r;
+    }
+    *got = n;
+    LOGV("fs: read %u off %llx size %x -> %x", id, (unsigned long long)off, size, n);
+    return 0;
+#else
     OVERLAPPED o{};
     o.Offset = (DWORD)off;
     o.OffsetHigh = (DWORD)(off >> 32);
@@ -119,6 +184,7 @@ static uint32_t do_read(uint32_t id, uint64_t off, uint32_t buf, uint32_t size, 
     *got = n;
     LOGV("fs: read %u off %llx size %x -> %lx", id, (unsigned long long)off, size, n);
     return 0;
+#endif
 }
 HLE_FN(fs_ReadFile, "_ZN2nn2fs8ReadFileENS0_10FileHandleExPvj") {  // (h r0, off r2:r3, buf [sp], size [sp+4])
     uint32_t got;
@@ -130,14 +196,27 @@ HLE_FN(fs_ReadFile2, "_ZN2nn2fs8ReadFileEPjNS0_10FileHandleExPvj") {  // (out r0
     if (out) st32(out, got);
 }
 HLE_FN(fs_WriteFile, "_ZN2nn2fs9WriteFileENS0_10FileHandleExPKvjRKNS0_11WriteOptionE") {
-    HANDLE h = file(c->r[0]);
+    FileH h = file(c->r[0]);
     uint64_t off = (uint64_t)c->r[3] << 32 | c->r[2];
+#ifdef _WIN32
     OVERLAPPED o{};
     o.Offset = (DWORD)off;
     o.OffsetHigh = (DWORD)(off >> 32);
     DWORD n;
     c->r[0] = WriteFile(h, GPTR(arg(c, 4)), arg(c, 5), &n, &o) ? 0 : RES_FAIL;
+#else
+    const uint32_t buf = arg(c, 4), size = arg(c, 5);
+    uint32_t n = 0;
+    while (n < size) {
+        ssize_t r = pwrite(h, GPTR(buf + n), size - n, (off_t)(off + n));
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) break;
+        n += (uint32_t)r;
+    }
+    c->r[0] = n == size ? 0 : RES_FAIL;
+#endif
 }
+#ifdef _WIN32
 HLE_FN(fs_FlushFile, "_ZN2nn2fs9FlushFileENS0_10FileHandleE") { FlushFileBuffers(file(c->r[0])); c->r[0] = 0; }
 HLE_FN(fs_GetSize, "_ZN2nn2fs11GetFileSizeEPxNS0_10FileHandleE") {
     LARGE_INTEGER sz{};
@@ -151,22 +230,45 @@ HLE_FN(fs_SetSize, "_ZN2nn2fs11SetFileSizeENS0_10FileHandleEx") {
     e.EndOfFile.QuadPart = (LONGLONG)((uint64_t)c->r[3] << 32 | c->r[2]);
     c->r[0] = SetFileInformationByHandle(h, FileEndOfFileInfo, &e, sizeof e) ? 0 : RES_FAIL;
 }
+#else
+HLE_FN(fs_FlushFile, "_ZN2nn2fs9FlushFileENS0_10FileHandleE") { fsync(file(c->r[0])); c->r[0] = 0; }
+HLE_FN(fs_GetSize, "_ZN2nn2fs11GetFileSizeEPxNS0_10FileHandleE") {
+    struct stat st{};
+    fstat(file(c->r[1]), &st);
+    st64(c->r[0], (uint64_t)st.st_size);
+    c->r[0] = 0;
+}
+HLE_FN(fs_SetSize, "_ZN2nn2fs11SetFileSizeENS0_10FileHandleEx") {
+    c->r[0] = ftruncate(file(c->r[0]), (off_t)((uint64_t)c->r[3] << 32 | c->r[2])) == 0 ? 0 : RES_FAIL;
+}
+#endif
 HLE_FN(fs_CloseFile, "_ZN2nn2fs9CloseFileENS0_10FileHandleE") {
     std::lock_guard<std::mutex> l(g_fs_lock);
     auto it = g_files.find(c->r[0]);
+#ifdef _WIN32
     if (it != g_files.end()) { CloseHandle(it->second); g_files.erase(it); }
+#else
+    if (it != g_files.end()) { close(it->second); g_files.erase(it); }
+#endif
 }
 HLE_FN(fs_CreateFile, "_ZN2nn2fs10CreateFileEPKcx") {  // (path r0, size r2:r3)
     LOGV("fs: create %s size %x", gstr(c->r[0]).c_str(), c->r[2]);
     fs::path p;
     if (!host_path(c->r[0], p)) { c->r[0] = RES_PATH_NOT_FOUND; return; }
     if (fs::exists(p)) { c->r[0] = RES_PATH_EXISTS; return; }
+#ifdef _WIN32
     HANDLE h = CreateFileW(p.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, 0, nullptr);
     if (h == INVALID_HANDLE_VALUE) { c->r[0] = RES_PATH_NOT_FOUND; return; }
     FILE_END_OF_FILE_INFO e;
     e.EndOfFile.QuadPart = (LONGLONG)((uint64_t)c->r[3] << 32 | c->r[2]);
     SetFileInformationByHandle(h, FileEndOfFileInfo, &e, sizeof e);
     CloseHandle(h);
+#else
+    int h = open(p.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0666);
+    if (h < 0) { c->r[0] = RES_PATH_NOT_FOUND; return; }
+    if (ftruncate(h, (off_t)((uint64_t)c->r[3] << 32 | c->r[2]))) log("fs: create %s: cannot set the size", p.string().c_str());
+    close(h);
+#endif
     c->r[0] = 0;
 }
 HLE_FN(fs_DeleteFile, "_ZN2nn2fs10DeleteFileEPKc") {

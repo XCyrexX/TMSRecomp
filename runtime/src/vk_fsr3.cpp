@@ -2,6 +2,7 @@
 // amd_fidelityfx_upscaler_vk.dll next to tms.exe, MIT licence per the SDK 2.4.0 docs/license.md; NOTES s62). Loaded at
 // run time: without the DLLs, or when the context cannot be made, fsr3_dispatch returns false and the caller falls
 // back (SMAA). Only the documented ffx API is used (ffx_api.h, ffx_upscale.h, vk/ffx_api_vk.h, MIT headers).
+#ifdef _WIN32
 #include "rt.h"
 #include "vk.h"
 #include "ffx_api.h"
@@ -161,3 +162,20 @@ bool fsr3_dispatch(const Fsr3Frame& f) {
 }
 
 }  // namespace vk
+#else
+// Linux: AMD ships the FidelityFX API only as Windows DLLs, so FSR 3 is not available; callers fall back to SMAA.
+#include "rt.h"
+#include "vk.h"
+
+using namespace rt;
+
+namespace vk {
+bool fsr3_ready(uint32_t, uint32_t) {
+    static bool said = false;
+    if (!said) said = true, log("fsr3: not available on Linux (FidelityFX API DLLs are Windows only): SMAA instead");
+    return false;
+}
+void fsr3_jitter(uint64_t, uint32_t, float* jx, float* jy) { *jx = *jy = 0; }
+bool fsr3_dispatch(const Fsr3Frame&) { return false; }
+}  // namespace vk
+#endif

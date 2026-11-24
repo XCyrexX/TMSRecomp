@@ -7,10 +7,15 @@
 // dumps (tools/padicons: find_discs.py, sheet.py, crop.py).
 // Faces follow ui.cpp's positional mapping: Switch A = east (PS circle, Xbox B), B = south (cross, A), X = north
 // (triangle, Y), Y = west (square, X).
-#include <windows.h>
+#include "plat.h"
+#ifdef _WIN32
 #include <d2d1.h>
 #include <dwrite.h>
 #include <wincodec.h>
+#else
+#include "draw_linux.h"
+#include <cmath>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -127,6 +132,7 @@ const Atlas k_atlases[] = {
     ATLAS_HALF(0x43e7b49de855cfd3ull, 1024, 1024, false, k_artists_cells),  // _US camp002
 };
 
+#ifdef _WIN32
 template <class T> void release(T*& p) { if (p) p->Release(), p = nullptr; }
 
 struct Painter {
@@ -253,6 +259,127 @@ struct Painter {
         text(style == 2 ? xb[i] : ps[i], D2D1::RectF(c.x, c.y + c.h * 0.03f, c.x + c.w, c.y + c.h), c.h * 0.58f, ink());
     }
 };
+#else
+// Linux: the same shapes with cairo / pango (draw_linux.h)
+struct RectF { float left, top, right, bottom; };
+struct Painter {
+    cairo_t* cr = nullptr;
+    bool plain = false, bubble = false, cut = false;
+    uint32_t fill = 0xFFFFFF;
+    uint32_t tint(uint32_t rgb) const { return cut ? 0x000000 : bubble ? 0xFFFFFF : fill == 0xFFFFFF ? rgb : 0x000000; }
+    uint32_t ink() const { return cut ? 0x000000 : bubble ? 0xFFFFFF : plain ? 0x5A5A5A : 0x000000; }
+
+    void text(const wchar_t* s, RectF r, float size, uint32_t rgb) {
+        draw::text(cr, draw::utf8(s), r.left, r.top, r.right - r.left, r.bottom - r.top, size, draw::rgb(rgb), 700,
+                   draw::CENTER, draw::k_icon_font);
+    }
+    void stroke(float w, uint32_t rgb) {
+        draw::set(cr, draw::rgb(rgb));
+        cairo_set_line_width(cr, w);
+        cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
+        cairo_set_line_join(cr, CAIRO_LINE_JOIN_ROUND);
+        cairo_stroke(cr);
+    }
+    void line(float x0, float y0, float x1, float y1, float w, uint32_t rgb) {
+        cairo_move_to(cr, x0, y0);
+        cairo_line_to(cr, x1, y1);
+        stroke(w, rgb);
+    }
+    void disc(float cx, float cy, float r) {
+        float sw = r * 0.16f, er = plain ? r : r - sw / 2;
+        draw::ellipse(cr, cx, cy, er, er);
+        draw::set(cr, draw::rgb(fill));
+        if (plain) { cairo_fill(cr); return; }
+        cairo_fill_preserve(cr);
+        cairo_set_line_width(cr, sw);
+        draw::set(cr, draw::rgb(0));
+        cairo_stroke(cr);
+    }
+    void rect(float x0, float y0, float x1, float y1) { cairo_rectangle(cr, x0, y0, x1 - x0, y1 - y0); }
+    void face(const Cell& c, int style) {
+        float cx = c.x + c.w / 2.0f, cy = c.y + c.h / 2.0f, r = c.w / 2.0f;
+        disc(cx, cy, r);
+        if (style == 2) {  // Xbox letters in their colours
+            static const wchar_t* const letter[] = {L"B", L"A", L"Y", L"X"};
+            static const uint32_t col[] = {0xD8262B, 0x3E9B2F, 0xE0A800, 0x2B6CD6};
+            text(letter[c.k], RectF{(float)c.x, c.y + r * 0.04f, (float)(c.x + c.w), (float)(c.y + c.h)}, r * 1.25f, tint(col[c.k]));
+            return;
+        }
+        float sw = r * 0.2f, g = r * 0.42f;  // PlayStation symbols, stroked
+        switch (c.k) {
+            case FACE_A:  // circle
+                draw::ellipse(cr, cx, cy, g, g);
+                stroke(sw, tint(0xE0464B));
+                break;
+            case FACE_B:  // cross
+                line(cx - g, cy - g, cx + g, cy + g, sw, tint(0x4A7FD8));
+                line(cx - g, cy + g, cx + g, cy - g, sw, tint(0x4A7FD8));
+                break;
+            case FACE_X: {  // triangle
+                float t = g * 1.15f, oy = cy + g * 0.15f;
+                cairo_move_to(cr, cx, oy - t);
+                cairo_line_to(cr, cx + t * 0.866f, oy + t * 0.5f);
+                cairo_line_to(cr, cx - t * 0.866f, oy + t * 0.5f);
+                cairo_close_path(cr);
+                stroke(sw, tint(0x2FA67E));
+                break;
+            }
+            default:  // square
+                rect(cx - g * 0.85f, cy - g * 0.85f, cx + g * 0.85f, cy + g * 0.85f);
+                cairo_set_line_cap(cr, CAIRO_LINE_CAP_BUTT);
+                draw::set(cr, draw::rgb(tint(0xD266AE)));
+                cairo_set_line_width(cr, sw);
+                cairo_set_line_join(cr, CAIRO_LINE_JOIN_MITER);
+                cairo_stroke(cr);
+                break;
+        }
+    }
+    void plus_minus(const Cell& c, int style) {
+        float cx = c.x + c.w / 2.0f, cy = c.y + c.h / 2.0f, r = c.w / 2.0f, sw = r * 0.16f;
+        disc(cx, cy, r);
+        if (c.k == PLUS) {  // Options / Menu: three lines
+            for (int i = -1; i <= 1; i++) line(cx - r * 0.38f, cy + i * r * 0.3f, cx + r * 0.38f, cy + i * r * 0.3f, sw, ink());
+        } else if (style == 2) {  // View: two overlapping squares
+            float s = r * 0.42f, o = r * 0.16f;
+            auto box = [&](float x0, float y0, float x1, float y1, bool filled) {
+                if (filled) { rect(x0, y0, x1, y1); draw::set(cr, draw::rgb(0xFFFFFF)); cairo_fill(cr); }
+                rect(x0, y0, x1, y1);
+                draw::set(cr, draw::rgb(ink()));
+                cairo_set_line_width(cr, sw * 0.8f);
+                cairo_set_line_join(cr, CAIRO_LINE_JOIN_MITER);
+                cairo_stroke(cr);
+            };
+            box(cx - s + o, cy - s - o + o * 0.2f, cx + s * 0.6f + o, cy + s * 0.6f - o, false);
+            box(cx - s * 0.6f - o, cy - s * 0.6f + o, cx + s - o, cy + s + o - o * 0.2f, true);
+        } else {  // Share / Create: arrow up out of a tray
+            line(cx, cy + r * 0.1f, cx, cy - r * 0.45f, sw, ink());
+            line(cx - r * 0.22f, cy - r * 0.23f, cx, cy - r * 0.45f, sw, ink());
+            line(cx + r * 0.22f, cy - r * 0.23f, cx, cy - r * 0.45f, sw, ink());
+            line(cx - r * 0.4f, cy + r * 0.05f, cx - r * 0.4f, cy + r * 0.4f, sw, ink());
+            line(cx - r * 0.4f, cy + r * 0.4f, cx + r * 0.4f, cy + r * 0.4f, sw, ink());
+            line(cx + r * 0.4f, cy + r * 0.4f, cx + r * 0.4f, cy + r * 0.05f, sw, ink());
+        }
+    }
+    void shoulder(const Cell& c, int style) {
+        static const wchar_t* const ps[] = {L"L1", L"R1", L"L2", L"R2"};
+        static const wchar_t* const xb[] = {L"LB", L"RB", L"LT", L"RT"};
+        float sw = c.h * 0.085f;
+        RectF rr{c.x + sw / 2, c.y + sw / 2, c.x + c.w - sw / 2, c.y + c.h - sw / 2};
+        if (plain) rr = RectF{(float)c.x, (float)c.y, (float)(c.x + c.w), (float)(c.y + c.h)};
+        draw::round_rect(cr, rr.left, rr.top, rr.right - rr.left, rr.bottom - rr.top, c.h * 0.28f);
+        draw::set(cr, draw::rgb(0xFFFFFF));
+        if (plain) cairo_fill(cr);
+        else {
+            cairo_fill_preserve(cr);
+            draw::set(cr, draw::rgb(0));
+            cairo_set_line_width(cr, sw);
+            cairo_stroke(cr);
+        }
+        int i = c.k - SH_L;
+        text(style == 2 ? xb[i] : ps[i], RectF{(float)c.x, c.y + c.h * 0.03f, (float)(c.x + c.w), (float)(c.y + c.h)}, c.h * 0.58f, ink());
+    }
+};
+#endif
 }  // namespace
 
 bool is_pad_icon_atlas(uint64_t hash) {
@@ -265,6 +392,7 @@ bool pad_icon_atlas_size(uint32_t w, uint32_t h) {
 }
 
 // Draws the cells' buttons over rgba (RGBA8, straight alpha, n x nh) in place. style 1 PlayStation, 2 Xbox.
+#ifdef _WIN32
 static bool paint_cells(int style, const std::vector<Cell>& cells, bool atlas_plain, int n, int nh, uint8_t* rgba) {
     Painter p;
     p.plain = atlas_plain;
@@ -322,6 +450,43 @@ static bool paint_cells(int style, const std::vector<Cell>& cells, bool atlas_pl
     DeleteDC(dc);
     return ok;
 }
+#else
+static bool paint_cells(int style, const std::vector<Cell>& cells, bool atlas_plain, int n, int nh, uint8_t* rgba) {
+    draw::Canvas cv(n, nh);
+    if (!cv.ok()) return false;
+    cv.clear();
+    Painter p;
+    p.cr = cv.cr;
+    p.plain = atlas_plain;
+    for (const Cell& c : cells) {
+        p.bubble = c.look == 3, p.cut = c.look == 4;
+        p.plain = c.look ? c.look == 1 || c.look >= 3 : atlas_plain;
+        p.fill = c.fill ? c.fill : 0xFFFFFF;
+        if (c.k <= FACE_Y) p.face(c, style);
+        else if (c.k <= MINUS) p.plus_minus(c, style);
+        else p.shoulder(c, style);
+    }
+    const uint8_t* base = cv.data();  // BGRA premultiplied, top-down
+    const int stride = cv.stride();
+    for (const Cell& c : cells)
+        for (int y = std::max(0, c.y - 1); y < std::min(nh, c.y + c.h + 1); y++)
+            for (int x = std::max(0, c.x - 1); x < std::min(n, c.x + c.w + 1); x++) {
+                const uint8_t* s = base + (size_t)y * stride + x * 4;
+                uint8_t* d = rgba + (y * n + x) * 4;
+                if (c.look == 4) {
+                    d[0] = d[1] = d[2] = 255;
+                    d[3] = (uint8_t)std::min(255, (s[0] + s[1] + s[2]) / 3);
+                    continue;
+                }
+                float sa = s[3] / 255.0f, da = d[3] / 255.0f, oa = sa + da * (1 - sa);
+                if (oa <= 0) continue;
+                for (int k = 0; k < 3; k++)
+                    d[k] = (uint8_t)std::min(255.0f, (s[2 - k] + d[k] * da * (1 - sa)) / oa + 0.5f);
+                d[3] = (uint8_t)(oa * 255 + 0.5f);
+            }
+    return true;
+}
+#endif
 
 // rgba: an atlas of k_atlases (RGBA8, straight alpha, w x h), changed in place. style 1 PlayStation, 2 Xbox.
 bool pad_icon_atlas(int style, uint64_t hash, uint32_t w, uint32_t h, uint8_t* rgba) {
@@ -477,6 +642,47 @@ const RAtlas k_res_atlases[] = {
 std::atomic<int> g_resist_icons{-1};
 
 // icon k at size x size, BGRA premultiplied; empty when there is no file
+#ifndef _WIN32
+// Linux: PNG through cairo, cropped to a square around its alpha bounds, scaled with a good filter
+std::vector<uint8_t> load_icon(int k, int size) {
+    std::vector<uint8_t> out;
+    const std::string name = std::string(k_res_files[k]) + ".png";
+    std::filesystem::path path = std::filesystem::path(g_data_dir) / "resist_icons" / name;
+    std::error_code ec;
+    if (!std::filesystem::exists(path, ec)) {
+        path = plat::exe_path().parent_path() / "resist_icons" / name;
+        if (!std::filesystem::exists(path, ec)) return out;
+    }
+    cairo_surface_t* img = cairo_image_surface_create_from_png(path.c_str());
+    if (cairo_surface_status(img) != CAIRO_STATUS_SUCCESS) {
+        cairo_surface_destroy(img);
+        log("resist icons: could not read %s", path.string().c_str());
+        return out;
+    }
+    const int iw = cairo_image_surface_get_width(img), ih = cairo_image_surface_get_height(img), st = cairo_image_surface_get_stride(img);
+    const uint8_t* px = cairo_image_surface_get_data(img);
+    int x0 = iw, y0 = ih, x1 = -1, y1 = -1;
+    for (int y = 0; y < ih; y++)
+        for (int x = 0; x < iw; x++)
+            if (px[(size_t)y * st + x * 4 + 3] > 24) x0 = std::min(x0, x), x1 = std::max(x1, x), y0 = std::min(y0, y), y1 = std::max(y1, y);
+    int cx = 0, cy = 0, side = std::min(iw, ih);
+    if (x1 >= x0) {
+        side = std::min({std::max(x1 - x0, y1 - y0) + 1, iw, ih});
+        cx = std::clamp((x0 + x1 + 1 - side) / 2, 0, iw - side), cy = std::clamp((y0 + y1 + 1 - side) / 2, 0, ih - side);
+    }
+    draw::Canvas cv(size, size);
+    cv.clear();
+    cairo_scale(cv.cr, (double)size / side, (double)size / side);
+    cairo_set_source_surface(cv.cr, img, -cx, -cy);
+    cairo_pattern_set_filter(cairo_get_source(cv.cr), CAIRO_FILTER_BEST);
+    cairo_paint(cv.cr);
+    cairo_surface_destroy(img);
+    out.resize((size_t)size * size * 4);
+    const uint8_t* src = cv.data();
+    for (int y = 0; y < size; y++) memcpy(out.data() + (size_t)y * size * 4, src + (size_t)y * cv.stride(), (size_t)size * 4);
+    return out;
+}
+#else
 std::vector<uint8_t> load_icon(int k, int size) {
     std::vector<uint8_t> out;
     // <data>\resist_icons wins (player override), else the set shipped next to tms.exe (user's own art, repo data/)
@@ -527,6 +733,7 @@ std::vector<uint8_t> load_icon(int k, int size) {
     if (out.empty()) log("resist icons: could not read %s", path.string().c_str());
     return out;
 }
+#endif
 }  // namespace
 
 bool resist_icons_on() {

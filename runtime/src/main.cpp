@@ -1,9 +1,19 @@
 // Boot: map the prelinked image, then do what rtld does and enter nn::init::Start on the main thread.
-#include <windows.h>
+#include "plat.h"
+#ifdef _WIN32
 #include <dbghelp.h>
 #include <psapi.h>
 #include <shlobj.h>
 #include <timeapi.h>
+#else
+#include <SDL3/SDL.h>
+#include <dlfcn.h>
+#include <execinfo.h>
+#include <pthread.h>
+#include <signal.h>
+#include <ucontext.h>
+#include <unistd.h>
+#endif
 
 #include <chrono>
 #include <cstdlib>
@@ -49,7 +59,7 @@ static bool is_issue(const char* s) {
 static void issue(const char* s) {
     static std::unordered_map<std::string, uint64_t> seen;
     static int tail = 0;  // lines after FATAL/CRASH (backtrace) are copied as they are
-    static const ULONGLONG t0 = GetTickCount64();
+    static const unsigned long long t0 = GetTickCount64();
     if (!g_issues) return;
     bool cont = tail > 0 && s[0] == ' ';
     if (!cont && !is_issue(s)) { tail = 0; return; }
@@ -70,9 +80,14 @@ static void issue(const char* s) {
     const char* tag = "";
     for (const char* k : known)
         if (!strncmp(s, k, strlen(k))) tag = "(known, harmless) ";
+#ifdef _WIN32
     SYSTEMTIME st;
     GetLocalTime(&st);
-    ULONGLONG ms = GetTickCount64() - t0;
+#else
+    struct { unsigned wHour, wMinute, wSecond; } st;
+    { time_t now = time(nullptr); tm lt{}; localtime_r(&now, &lt); st = {(unsigned)lt.tm_hour, (unsigned)lt.tm_min, (unsigned)lt.tm_sec}; }
+#endif
+    unsigned long long ms = GetTickCount64() - t0;
     fprintf(g_issues, "[%02u:%02u:%02u run %llu:%02llu] %s%s", st.wHour, st.wMinute, st.wSecond, ms / 60000, ms / 1000 % 60,
             tag, s);
     if (n > 3) fprintf(g_issues, "   (seen %llu times)", (unsigned long long)n);
@@ -132,8 +147,13 @@ void fatal(const char* fmt, ...) {
     log("FATAL: %s", buf);
     if (KThread* t = cur()) { log("  thread %s", t->name.c_str()); guest_backtrace(t->cpu); }
     fflush(nullptr);
+#ifdef _WIN32
     if (g_own_console) MessageBoxA(nullptr, buf, "TMSRecomp: fatal error", MB_ICONERROR);
     TerminateProcess(GetCurrentProcess(), 3);
+#else
+    if (g_own_console) SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "TMSRecomp: fatal error", buf, nullptr);
+    _exit(3);
+#endif
     for (;;) {}
 }
 
@@ -213,6 +233,7 @@ using namespace rt;
 // or writes) guest memory [addr, addr+len), to find frame-counted game code. The host page is guarded; a hit logs the
 // generated function (F_<guest address> from tms.pdb) once per host instruction, then runs that instruction
 // single-stepped with the page open and guards it again. Other threads touching the page in that window are missed.
+#ifdef _WIN32
 static struct { uint32_t lo = 0, hi = 0; bool reads = false; uint8_t* page = nullptr; } g_watch;
 static thread_local bool t_watch_step;
 static std::mutex g_watch_lock;
@@ -471,6 +492,81 @@ static LONG WINAPI on_crash(EXCEPTION_POINTERS* e) {
     TerminateProcess(GetCurrentProcess(), 4);
     return EXCEPTION_EXECUTE_HANDLER;
 }
+#else  // Linux
+// The Windows debugging aids (NX_PROFILE sampling profiler, NX_CONTROL "watch", guest call chains from tms.pdb) use
+// dbghelp; on Linux they report that they are not available. Crashes are reported by a SIGSEGV / SIGBUS / SIGILL /
+// SIGFPE handler, which first gives memory.cpp's write watch its faults.
+void rt::profile_start() {
+    static bool said = false;
+    if (getenv("NX_PROFILE") && !said) said = true, log("[profile] not available on Linux (use perf)");
+}
+
+void rt::dump_command(const char* args) {  // pages that are not committed are written as zeros
+    unsigned lo = 0, hi = 0;
+    char path[260] = "";
+    if (sscanf(args, " %x %x %259s", &lo, &hi, path) < 3 || hi <= lo) { log("[dump] usage: dump lo hi file"); return; }
+    uint64_t frame = g_frame_no;
+    std::vector<uint8_t> snap(hi - (lo & ~0xfffu));
+    for (uint32_t a = lo & ~0xfffu; a < hi; a += 0x1000)
+        if (mem_query(a).state != MS_FREE) memcpy(&snap[a - (lo & ~0xfffu)], GPTR(a), std::min<size_t>(0x1000, hi - a));
+    uint64_t frame2 = g_frame_no;
+    FILE* f = fopen(path, "wb");
+    if (!f) { log("[dump] cannot write %s", path); return; }
+    fwrite(snap.data(), 1, snap.size(), f);
+    fclose(f);
+    log("[dump] frames %llu-%llu: %08x-%08x -> %s", (unsigned long long)frame, (unsigned long long)frame2, lo & ~0xfffu, hi, path);
+}
+
+void rt::watch_command(const char*) { log("[watch] not available on Linux"); }
+std::string rt::guest_chain() { return ""; }
+
+static void on_crash(int sig, siginfo_t* si, void* uc) {
+    if ((sig == SIGSEGV || sig == SIGBUS) && mem_fault(si->si_addr)) return;  // a write-watched page: run it again
+    static std::atomic<bool> once{false};
+    if (once.exchange(true)) _exit(4);  // a crash inside the report
+    const uint64_t fa = (uint64_t)si->si_addr;
+    const void* pc = (const void*)((ucontext_t*)uc)->uc_mcontext.gregs[REG_RIP];
+    char extra[128] = "";
+    if (fa >= GUEST_BASE && fa < GUEST_BASE + 0x100010000ull)
+        snprintf(extra, sizeof extra, " (guest address %08llx)", (unsigned long long)(fa - GUEST_BASE));
+    // "tms+off" / "game.so+off" (llvm-symbolizer --obj=<file> <off>)
+    auto where = [](const void* a, char* out, size_t n) {
+        Dl_info di{};
+        if (!dladdr(a, &di) || !di.dli_fname) return false;
+        const char* base = strrchr(di.dli_fname, '/');
+        snprintf(out, n, "%s+%#llx", base ? base + 1 : di.dli_fname, (unsigned long long)((uintptr_t)a - (uintptr_t)di.dli_fbase));
+        return true;
+    };
+    char at[96] = "?";
+    where(pc, at, sizeof at);
+    log("CRASH: signal %d at host %p (%s), access %llx%s", sig, pc, at, (unsigned long long)fa, extra);
+    void* frames[24];
+    int nf = backtrace(frames, 24);
+    std::string bt;
+    char b[96];
+    for (int i = 0; i < nf; i++)
+        if (where(frames[i], b, sizeof b)) bt += std::string(" ") + b;
+    log("  host stack:%s", bt.c_str());
+    if (KThread* t = cur()) {
+        Cpu& c = t->cpu;
+        log("  guest thread %s: lr %s", t->name.c_str(), symbol_at(c.r[14]));
+        for (int i = 0; i < 16; i += 4) log("  r%-2d %08x %08x %08x %08x", i, c.r[i], c.r[i + 1], c.r[i + 2], c.r[i + 3]);
+        guest_backtrace(c);
+    }
+    fflush(nullptr);
+    if (g_own_console) SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "TMSRecomp", "The game crashed. Details are in the log (nx.log in the data folder).", nullptr);
+    _exit(4);
+}
+static void install_crash_handler() {
+    struct sigaction sa{};
+    sa.sa_sigaction = on_crash;
+    sa.sa_flags = SA_SIGINFO | SA_NODEFER;  // NODEFER: a watched-page fault inside a handler of ours still works
+    sigemptyset(&sa.sa_mask);
+    for (int s : {SIGSEGV, SIGBUS, SIGILL, SIGFPE}) sigaction(s, &sa, nullptr);
+    signal(SIGPIPE, SIG_IGN);  // a helper that died (shader translator): write() fails with an error, as on Windows
+}
+#endif
+
 
 // settings.ini next to tms.exe: "key = value" lines become NX_KEY unless that environment variable is already set.
 // ponytail: ANSI paths only (getenv / _putenv_s); a non-ASCII data folder needs the wide-char API.
@@ -500,6 +596,9 @@ static bool is_data(const std::filesystem::path& p) {
 }
 
 static std::filesystem::path pick_data_folder() {
+#ifndef _WIN32
+    return {};  // Linux: no folder dialog; --data, NX_DATA, settings.ini "data =" or <data>/build/tms
+#else
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     BROWSEINFOW bi{};
     bi.lpszTitle = L"TMSRecomp: select the game data folder (the one with link\\image.bin and romfs)";
@@ -511,8 +610,10 @@ static std::filesystem::path pick_data_folder() {
         CoTaskMemFree(id);
     }
     return p;
+#endif
 }
 
+#ifdef _WIN32
 int main(int argc, char** argv) {
     AddVectoredExceptionHandler(1, on_crash);
     AddVectoredExceptionHandler(1, on_watch);  // first: watch faults are not crashes
@@ -524,6 +625,28 @@ int main(int argc, char** argv) {
     wchar_t exe[MAX_PATH];
     GetModuleFileNameW(nullptr, exe, MAX_PATH);
     const std::filesystem::path exe_dir = std::filesystem::path(exe).parent_path(), ini = exe_dir / "settings.ini";
+#else
+static int tms_main(int argc, char** argv);
+// The guest main thread runs on the calling thread and its recompiled calls nest deeply: Windows links tms.exe with a
+// 64 MiB stack. Linux gives the main thread 8 MiB, so the game runs on a thread of its own with 64 MiB.
+int main(int argc, char** argv) {
+    struct Args { int argc; char** argv; int ret; } a{argc, argv, 0};
+    pthread_attr_t at;
+    pthread_attr_init(&at);
+    pthread_attr_setstacksize(&at, 64u << 20);
+    pthread_t th;
+    if (pthread_create(&th, &at, [](void* p) -> void* { auto* a = (Args*)p; a->ret = tms_main(a->argc, a->argv); return nullptr; }, &a)) {
+        fprintf(stderr, "TMSRecomp: cannot start the game thread\n");
+        return 1;
+    }
+    pthread_join(th, nullptr);
+    return a.ret;
+}
+static int tms_main(int argc, char** argv) {
+    install_crash_handler();
+    g_own_console = !isatty(2);  // started from a desktop entry / AppImage: errors also in a message box
+    const std::filesystem::path exe_dir = plat::exe_path().parent_path(), ini = plat::settings_ini();
+#endif
     for (int i = 1; i + 1 < argc; i++)  // --set key=value: a settings.ini line for this run only (not saved)
         if (!strcmp(argv[i], "--set")) {
             std::string kv = argv[++i];
@@ -547,8 +670,15 @@ int main(int argc, char** argv) {
             g_data = p;
             std::ofstream(ini, std::ios::app) << "data = " << p.string() << "\n";
         } else {
+#ifdef _WIN32
             MessageBoxA(nullptr, "Game data not found: the folder needs link\\image.bin and romfs (see README).",
                         "TMSRecomp", MB_ICONERROR);
+#else
+            log("Game data not found: give the folder with link/image.bin and romfs (--data <folder>, NX_DATA or data = in %s)",
+                ini.string().c_str());
+            SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "TMSRecomp",
+                                     "Game data not found: the folder needs link/image.bin and romfs (see README).", nullptr);
+#endif
             return 1;
         }
     }
@@ -562,8 +692,14 @@ int main(int argc, char** argv) {
     g_log = fopen(log_path.string().c_str(), "w");
     g_issues = fopen((g_data / "issues.log").string().c_str(), "w");
     if (g_issues) {
+#ifdef _WIN32
         SYSTEMTIME st;
         GetLocalTime(&st);
+#else
+        struct { unsigned wYear, wMonth, wDay, wHour, wMinute, wSecond; } st;
+        { time_t now = time(nullptr); tm lt{}; localtime_r(&now, &lt);
+          st = {(unsigned)lt.tm_year + 1900, (unsigned)lt.tm_mon + 1, (unsigned)lt.tm_mday, (unsigned)lt.tm_hour, (unsigned)lt.tm_min, (unsigned)lt.tm_sec}; }
+#endif
         fprintf(g_issues, "TMSRecomp issues log, run started %04u-%02u-%02u %02u:%02u:%02u (build %s %s). Full log: %s\n",
                 st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, __DATE__, __TIME__,
                 log_path.string().c_str());

@@ -45,6 +45,10 @@ Region mem_query(uint32_t addr);
 double process_private_mb(), guest_committed_mb();  // memory.cpp
 void mem_regions_report();  // memory.cpp, NX_MEM_REGIONS
 bool mem_written(uint32_t addr, uint32_t size);  // CPU wrote the range since the last call (write watch)
+void mem_make_writable(uint32_t addr, uint32_t size);  // Linux: open watched pages before a driver pins them (no-op on Windows)
+#ifndef _WIN32
+bool mem_fault(void* host_addr);  // Linux SIGSEGV handler: a write to a watched page (true: it is open again, retry)
+#endif
 uint32_t kernel_alloc(uint32_t size, uint32_t align = 0x1000);  // kernel-owned pages (TLR, stacks)
 uint32_t hle_alloc(uint32_t size, uint32_t align = 16);         // HLE scratch visible to the guest
 uint32_t heap_set_size(uint32_t size);                          // svcSetHeapSize
@@ -132,6 +136,8 @@ struct SubsBitmap { uint32_t x, y, w, h; std::vector<uint32_t> rgba; };  // prem
 void subs_voice(const char* path);
 std::shared_ptr<const SubsBitmap> subs_frame(uint32_t fw, uint32_t fh);
 bool subs_enabled();
+// what the present path blends over a frame of that size: the subtitles (Linux: and the menu, drawn into the frame)
+std::shared_ptr<const SubsBitmap> frame_overlay(uint32_t fw, uint32_t fh);
 void set_subs_enabled(bool on);
 void subs_notice(const std::wstring& text);  // a short line of ours in the subtitle spot (1.5 s)
 constexpr uint64_t k_button_atlas_hash = 0x34c763427410e392ull;  // the common button atlas

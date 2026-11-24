@@ -1,6 +1,13 @@
 // Maxwell shaders -> SPIR-V through the shaderc sidecar (tools/shaderc, Ryujinx's MIT translator), then Vulkan
 // shader modules + descriptor layouts per NVN program.
-#include <windows.h>
+#include "plat.h"
+#ifndef _WIN32
+#include <fcntl.h>
+#include <spawn.h>
+#include <sys/stat.h>
+#include <unistd.h>
+extern char** environ;
+#endif
 
 #include <atomic>
 #include <chrono>
@@ -16,21 +23,80 @@ using namespace rt;
 
 namespace vk {
 
+#ifdef _WIN32
 static HANDLE g_in_w, g_out_r;
+#else
+static int g_in_w = -1, g_out_r = -1;
+static bool file_exists(const std::string& p) { struct stat st; return stat(p.c_str(), &st) == 0; }
+#endif
 static std::mutex g_sc_lock;
 
 // The translator: <exe dir>/shaderc (release ZIP) or <data>/shaderc (built from source). Copies keep the file time,
 // so the cache stamp below stays the same (compared in whole seconds: ZIP keeps no fractions).
 static std::string exe_dir() {
+#ifdef _WIN32
     char exe[MAX_PATH];
     std::string d(exe, GetModuleFileNameA(nullptr, exe, MAX_PATH));
     return d.substr(0, d.find_last_of("\\/"));
+#else
+    return plat::exe_path().parent_path().string();
+#endif
 }
 std::string seed_dir() { return exe_dir() + "/cache_seed"; }
 static std::string shaderc_dll() {
     std::string d = exe_dir() + "/shaderc/NxShader.dll";
+#ifdef _WIN32
     return GetFileAttributesA(d.c_str()) != INVALID_FILE_ATTRIBUTES ? d : g_data_dir + "/shaderc/NxShader.dll";
+#else
+    return file_exists(d) ? d : g_data_dir + "/shaderc/NxShader.dll";
+#endif
 }
+#ifndef _WIN32
+// Linux: a self-contained publish (-r linux-x64: NxShader next to libhostfxr.so, no .NET install) or the
+// framework-dependent dll through dotnet. Pipes for stdin / stdout, stderr shared; posix_spawn, so the big guest
+// reservation is never copied.
+static void spawn() {
+    int in[2], out[2];
+    if (pipe2(in, O_CLOEXEC) || pipe2(out, O_CLOEXEC)) fatal("shader translator: pipe failed");
+    const std::string dll = shaderc_dll(), sc = dll.substr(0, dll.size() - 4),
+                      host = dll.substr(0, dll.find_last_of('/')) + "/libhostfxr.so";
+    std::vector<std::string> args = file_exists(host) && access(sc.c_str(), X_OK) == 0 ? std::vector<std::string>{sc}
+                                                                                         : std::vector<std::string>{"dotnet", dll};
+    std::vector<char*> argv;
+    for (auto& a : args) argv.push_back(a.data());
+    argv.push_back(nullptr);
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_adddup2(&fa, in[0], 0);
+    posix_spawn_file_actions_adddup2(&fa, out[1], 1);
+    pid_t pid;
+    const int e = posix_spawnp(&pid, argv[0], &fa, nullptr, argv.data(), environ);
+    posix_spawn_file_actions_destroy(&fa);
+    if (e) fatal("cannot start the shader translator (%s): %s", args.back().c_str(), strerror(e));
+    close(in[0]);
+    close(out[1]);
+    g_in_w = in[1];
+    g_out_r = out[0];
+    log("vk: shader translator started (%s)", args[0].c_str());
+}
+
+static void wr(const void* p, size_t n) {
+    for (size_t done = 0; done < n;) {
+        ssize_t w = write(g_in_w, (const char*)p + done, n - done);
+        if (w < 0 && errno == EINTR) continue;
+        if (w <= 0) fatal("shader translator: write failed");
+        done += (size_t)w;
+    }
+}
+static void rd(void* p, size_t n) {
+    for (size_t got = 0; got < n;) {
+        ssize_t r = read(g_out_r, (char*)p + got, n - got);
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) fatal("shader translator: read failed (did it crash?)");
+        got += (size_t)r;
+    }
+}
+#else
 static void spawn() {
     SECURITY_ATTRIBUTES sa{sizeof sa, nullptr, TRUE};
     HANDLE in_r, out_w;
@@ -67,6 +133,7 @@ static void rd(void* p, size_t n) {
         got += r;
     }
 }
+#endif
 template <class T> T rdv() { T v; rd(&v, sizeof v); return v; }
 
 // ------------------------------------------------------------------------------------------------- translation cache
@@ -87,10 +154,18 @@ static void tcache_open() {
     static bool done = false;
     if (done) return;
     done = true;
+#ifdef _WIN32
     WIN32_FILE_ATTRIBUTE_DATA a{};
     GetFileAttributesExA(shaderc_dll().c_str(), GetFileExInfoStandard, &a);
     uint64_t stamp[3] = {0x31435358ull /* "XSC1" */, ((uint64_t)a.nFileSizeHigh << 32) | a.nFileSizeLow,
                          ((uint64_t)a.ftLastWriteTime.dwHighDateTime << 32) | a.ftLastWriteTime.dwLowDateTime};
+#else
+    // the same stamp as on Windows (FILETIME: 100 ns since 1601), as shaderscan.py writes it
+    struct stat st{};
+    stat(shaderc_dll().c_str(), &st);
+    uint64_t stamp[3] = {0x31435358ull /* "XSC1" */, (uint64_t)st.st_size,
+                         ((uint64_t)st.st_mtim.tv_sec * 1000000000ull + (uint64_t)st.st_mtim.tv_nsec) / 100 + 116444736000000000ull};
+#endif
     std::string dir = g_data_dir + "/cache", path = dir + "/shaders.bin";
     CreateDirectoryA(dir.c_str(), nullptr);
     // a release may ship <exe dir>/cache_seed/shaders.bin (the shaders of a full play): read first, never written
@@ -116,7 +191,11 @@ static void tcache_open() {
             ok || g_tcache.size() ? "" : " (none: other translator build)", shaderc_dll().c_str());
         if (!ok && g_tcache.empty() && p == path) DeleteFileA(path.c_str());
     }
+#ifdef _WIN32
     bool fresh = GetFileAttributesA(path.c_str()) == INVALID_FILE_ATTRIBUTES;
+#else
+    bool fresh = !file_exists(path);
+#endif
     g_tcache_file = fopen(path.c_str(), "ab");
     if (g_tcache_file && fresh) fwrite(stamp, sizeof stamp, 1, g_tcache_file), fflush(g_tcache_file);
 }
@@ -383,7 +462,11 @@ bool translate(uint32_t stage, const uint8_t* code, uint32_t len, const uint32_t
 }
 
 static bool translate_sidecar(uint32_t stage, const uint8_t* code, uint32_t len, const uint32_t local[3], uint32_t consts_off, uint32_t consts_size, Translated& out, const uint8_t* attr_types) {
+#ifdef _WIN32
     if (!g_in_w) spawn();
+#else
+    if (g_in_w < 0) spawn();
+#endif
     uint32_t hdr[3] = {0x4853584E, stage, len};
     wr(hdr, sizeof hdr);
     if (stage == 0) wr(local, 12);

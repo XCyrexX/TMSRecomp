@@ -75,6 +75,7 @@ Sessions #FE Encore and all related names, characters and assets are trademarks 
 - [Known issues](#known-issues)
 - [Reporting a bug](#reporting-a-bug)
 - [How it works](#how-it-works)
+- [Linux (experimental)](#linux-experimental)
 - [Building from source](#building-from-source)
 - [License and credits](#license-and-credits)
 
@@ -315,14 +316,14 @@ level instead of +10%. Enemy HP and stats are the same on every difficulty.
 - **Screen tearing with VRR.** Turn on G-SYNC / FreeSync in your GPU driver and use VSync = VRR in the launcher.
 - **The game does not start / closes at once.** Update your GPU driver, then send the bug report described below.
 - **Can I use an updated game (1.0.1+) or DLC?** Not yet: the hooks use fixed addresses of the 1.0.0 build.
-- **Linux / Steam Deck?** Not supported yet; Proton is untested.
+- **Linux / Steam Deck?** An experimental native Linux build can be built from source: see [Linux (experimental)](#linux-experimental). Proton is untested.
 - **Where are my files?** Everything (game files, saves, cache, logs, screenshots, mods) is in the game files folder
   chosen during setup; settings are in `settings.ini` next to `tms.exe`.
 
 ## Known issues
 
 - Tested from the start through chapter 2 only; later chapters may have problems nobody has seen yet.
-- Tested on NVIDIA RTX only. AMD and Intel GPUs, integrated GPUs and Steam Deck / Linux are untested.
+- Tested on NVIDIA RTX only (Linux: one NVIDIA GTX 1650). AMD and Intel GPUs, integrated GPUs and Steam Deck are untested.
 - Only the base game 1.0.0 without update is supported.
 - Walking NPCs turn in small 30 Hz steps at high frame rates.
 - Custom battle music: encrypted `.adx` files need their key in `settings.ini` (`custom_bgm_key`); none is included.
@@ -356,6 +357,47 @@ Never post game files, keys or links to them.
 - `tools/setup/`: the player's first-run setup (extract, recompile, build `game.dll`, translate shaders).
 - `runtime/launcher/`: the launcher (Win32 + Direct2D).
 - `NOTES.md`: the full technical log of the project.
+
+## Linux (experimental)
+
+A native Linux x86-64 build of the same runtime, launcher and setup (no Wine or Proton). As on Windows, the game is
+built on your PC from your own dump; nothing of the game is in the repository or a build.
+
+**Tested so far** (Ubuntu 26.04, NVIDIA GTX 1650, driver 620): setup from an extracted folder, launcher, title screen,
+intro movie, story scenes, field, camp menu, saving and loading, the F1 menu, at a steady 60 fps. Battles, AMD and Intel
+GPUs and the Steam Deck are not tested yet.
+
+**Differences from Windows**
+- No AMD FSR 3 and no NVIDIA DLSS: AMD ships the FidelityFX API only as Windows DLLs, and the NGX (DLSS) path is not
+  wired up. Choosing them falls back to SMAA, as on a Windows PC without them. FXAA, SMAA, MSAA, FSR 1 and sharpening work.
+- The launcher's Update button opens the release page (releases are Windows downloads).
+- `settings.ini` sits next to `tms` when that folder is writable, else in `~/.config/TMSRecomp/settings.ini` (an
+  AppImage or system install); `NX_INI` overrides it. The recompiled code is `game.so` next to `tms`, or where
+  `NX_GAME_SO` points.
+- The Windows-only debugging aids (`NX_PROFILE`, `NX_CONTROL watch`, `NX_STALL_STATS`, `NX_MEM_REGIONS`) say they are
+  not available; use `perf` instead.
+- File names in the game files folder are matched case-insensitively, as on Windows.
+
+**Packages** (Ubuntu / Debian names; other distributions have the same libraries): `clang lld llvm cmake ninja-build
+pkg-config libsdl3-dev libvulkan-dev libvpx-dev libcairo2-dev libpango1.0-dev python3-venv dotnet-sdk-10.0`, and
+nstool 1.9.2 built from source (`make deps && make`). Capstone for the translator:
+`python3 -m venv venv && venv/bin/pip install capstone`.
+
+**Build** (the same third-party Ryujinx checkout and patch as on Windows, in `private/third_party/ryubing`):
+
+1. `clang -O2 -shared -fPIC -o tools/texextract/fasttex.so tools/texextract/fasttex.c`
+2. `dotnet build tools/shaderc/NxShader.csproj -c Release -o private/tms/shaderc`
+3. Set up the game data folder with your own dump, compile `game.so` and translate all shaders:
+   `venv/bin/python tools/setup/setup.py --nsp <game.nsp> --keys <prod.keys> --data private/tms --nstool <nstool> --install private/tms/build`
+   (or `--folder <extracted folder>` instead of `--nsp` / `--keys` / `--data`). This writes `private/tms/gen`.
+4. `cmake -S . -B private/tms/build -G Ninja -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_BUILD_TYPE=RelWithDebInfo`
+   and `ninja -C private/tms/build tms launcher` (`ninja -C private/tms/build` also rebuilds `game.so`).
+5. Run `private/tms/build/launcher`, or `private/tms/build/tms --data private/tms`.
+
+The Linux code paths are marked `#ifdef _WIN32 ... #else` in place; `runtime/src/plat.h` has the small POSIX stand-ins,
+`runtime/src/draw_linux.h` the cairo / pango drawing (menu, subtitles, button icons) and `runtime/launcher/linux_shim.h`
+the launcher's window layer (SDL3). Guest memory write tracking (texture re-uploads) uses page protection in place of
+Windows' write watch (`memory.cpp`).
 
 ## Building from source
 

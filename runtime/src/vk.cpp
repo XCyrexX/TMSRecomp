@@ -2,7 +2,7 @@
 // NVN backend on Vulkan 1.3: device and swapchain on the SDL window, memory pools imported zero-copy
 // (VK_EXT_external_memory_host), textures as device-local images, recorded NVN commands replayed per submit.
 // ponytail: every submit waits for the GPU (vkQueueWaitIdle); pipeline it once frame times are measured.
-#include <windows.h>
+#include "plat.h"
 
 #include "vk.h"
 #include "sharpen_spv.h"
@@ -567,6 +567,7 @@ GuestBuffer guest_buffer(uint64_t gpu) {
             return {gb->buf, gb->offset + off, gb->size - gb->offset - off};
         }
         HitchTimer ht{HITCH_IMPORT};
+        mem_make_writable(base, size);  // Linux: the driver pins the pages for writing (watched pages are read-only)
         VkMemoryHostPointerPropertiesEXT hp{VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
         VKC(vkGetMemoryHostPointerPropertiesEXT(dev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, GPTR(base), &hp));
         VkExternalMemoryBufferCreateInfo emb{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO, nullptr,
@@ -1237,7 +1238,9 @@ static void make_staging(Image& im, uint32_t w, uint32_t h, VkFormat fmt) {
 
 static void present_thread() {
     t_present_thread = true;
+#ifdef _WIN32
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);  // its wake-up time is the frame's display time
+#endif
     VkCommandPool pool;
     VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, nullptr,
                                 VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, qfam};
@@ -1520,7 +1523,7 @@ static void overlay_subs(int slot, Image& st, std::shared_ptr<const rt::SubsBitm
 // screenshots show what the player sees: with sharpening on, the sharpened frame; subtitles on top
 static Image* shot_source(Image* src) {
     static Image img;
-    auto subs = rt::subs_frame(src->w, src->h);
+    auto subs = rt::frame_overlay(src->w, src->h);
     if ((rt::sharpen_setting() <= 0 && !subs) || src->format != VK_FORMAT_R8G8B8A8_UNORM) return src;
     if (img.w != src->w || img.h != src->h || img.format != src->format) make_staging(img, src->w, src->h, src->format);
     begin();
@@ -1568,7 +1571,7 @@ static void present_async(Image* src) {
         c.extent = {src->w, src->h, 1};
         vkCmdCopyImage(g_cb, src->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, st.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
     }
-    overlay_subs(i, st, rt::subs_frame(st.w, st.h));
+    overlay_subs(i, st, rt::frame_overlay(st.w, st.h));
     transition(g_cb, &st, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     g_staged[i].serial = end_and_submit();
     {

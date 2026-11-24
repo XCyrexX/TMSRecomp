@@ -4,10 +4,21 @@
 // translated by hand) maps file stem -> seconds, speaker, English. A worker thread draws the active lines with
 // DirectWrite into a premultiplied RGBA bitmap; vk.cpp blends it over the frame (overlay_spv.h), so screenshots and
 // recordings include it.
-#include <windows.h>
+#include "plat.h"
+#ifdef _WIN32
 #include <d2d1.h>
 #include <dwrite.h>
 #include <wincodec.h>
+#else
+#include "draw_linux.h"
+#include <algorithm>
+namespace D2D1 {
+struct ColorF {
+    float r, g, b, a;
+    ColorF(float r_, float g_, float b_, float a_ = 1) : r(r_), g(g_), b(b_), a(a_) {}
+};
+}  // namespace D2D1
+#endif
 
 #include <atomic>
 #include <chrono>
@@ -31,6 +42,7 @@ struct Line { const Entry* e; int64_t until; };
 std::unordered_map<std::string, Entry>& table() {
     static std::unordered_map<std::string, Entry> t = [] {
         std::unordered_map<std::string, Entry> m;
+#ifdef _WIN32
         wchar_t exe[MAX_PATH];
         GetModuleFileNameW(nullptr, exe, MAX_PATH);
         std::ifstream f(std::filesystem::path(exe).parent_path() / "subtitles_en.tsv");
@@ -39,6 +51,10 @@ std::unordered_map<std::string, Entry>& table() {
             MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), w.data(), (int)w.size());
             return w;
         };
+#else
+        std::ifstream f(plat::exe_path().parent_path() / "subtitles_en.tsv");
+        auto wide = [](const std::string& s) { return draw::wide(s); };
+#endif
         for (std::string l; std::getline(f, l);) {  // stem \t seconds \t speaker \t text
             if (!l.empty() && l.back() == '\r') l.pop_back();
             if (l.empty() || l[0] == '#') continue;
@@ -81,6 +97,7 @@ D2D1::ColorF speaker_color(const std::wstring& s) {
 }
 
 // Draws the lines into a new bitmap: one row per line, centred, speaker name coloured, black outline.
+#ifdef _WIN32
 std::shared_ptr<SubsBitmap> draw(const std::vector<Line>& lines, uint32_t fw, uint32_t fh) {
     static IWICImagingFactory* wic = nullptr;
     static ID2D1Factory* d2d = nullptr;
@@ -168,6 +185,77 @@ std::shared_ptr<SubsBitmap> draw(const std::vector<Line>& lines, uint32_t fw, ui
     if (bmp) bmp->Release();
     return out;
 }
+#else
+// Linux: the same layout with pango: one row per line, centred, speaker name coloured, black outline
+std::shared_ptr<SubsBitmap> draw(const std::vector<Line>& lines, uint32_t fw, uint32_t fh) {
+    const float size = fh * 0.034f, row = size * 1.45f, pad = size * 0.25f;
+    const uint32_t bw = fw * 2 / 3;
+    if (!bw) return nullptr;
+    // measure on a scratch surface first: the bitmap height follows the wrapped rows
+    cairo_surface_t* scratch = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, 1, 1);
+    cairo_t* mcr = cairo_create(scratch);
+    struct Row { std::string text; size_t name_bytes; draw::Color name; float y; };
+    std::vector<Row> rows;
+    float bhf = 2 * pad;
+    for (const Line& l : lines) {
+        const Entry& e = *l.e;
+        const std::string who = draw::utf8(e.speaker), what = draw::utf8(e.text);
+        Row r{who.empty() ? what : who + ": " + what, who.empty() ? 0 : who.size() + 1, {}, bhf - pad};
+        const D2D1::ColorF c = speaker_color(e.speaker);
+        r.name = {c.r, c.g, c.b, c.a};
+        PangoLayout* pl = draw::layout(mcr, r.text, size, 600);
+        pango_layout_set_width(pl, (int)(bw * PANGO_SCALE));
+        pango_layout_set_wrap(pl, PANGO_WRAP_WORD_CHAR);
+        int lw, lh;
+        pango_layout_get_pixel_size(pl, &lw, &lh);
+        g_object_unref(pl);
+        rows.push_back(r);
+        bhf += std::max(row, lh + size * 0.25f);
+    }
+    cairo_destroy(mcr);
+    cairo_surface_destroy(scratch);
+    if (rows.empty()) return nullptr;
+    const uint32_t bh = (uint32_t)bhf;
+    draw::Canvas cv((int)bw, (int)bh);
+    if (!cv.ok()) return nullptr;
+    cv.clear();
+    for (const Row& r : rows) {
+        PangoLayout* pl = draw::layout(cv.cr, r.text, size, 600);
+        pango_layout_set_width(pl, (int)(bw * PANGO_SCALE));
+        pango_layout_set_wrap(pl, PANGO_WRAP_WORD_CHAR);
+        pango_layout_set_alignment(pl, PANGO_ALIGN_CENTER);
+        const float y = pad + r.y, o = std::max(1.5f, size * 0.07f);
+        static const float dirs[8][2] = {{-1, 0}, {1, 0}, {0, -1}, {0, 1}, {-0.7f, -0.7f}, {0.7f, -0.7f}, {-0.7f, 0.7f}, {0.7f, 0.7f}};
+        cairo_set_source_rgba(cv.cr, 0, 0, 0, 0.9);
+        for (auto& d : dirs) cairo_move_to(cv.cr, d[0] * o, y + d[1] * o), pango_cairo_show_layout(cv.cr, pl);
+        if (r.name_bytes) {  // the speaker's colour on "Name:" (the outline above stays black)
+            PangoAttrList* al = pango_attr_list_new();
+            PangoAttribute* a = pango_attr_foreground_new((guint16)(r.name.r * 65535), (guint16)(r.name.g * 65535), (guint16)(r.name.b * 65535));
+            a->start_index = 0, a->end_index = (guint)r.name_bytes;
+            pango_attr_list_insert(al, a);
+            pango_layout_set_attributes(pl, al);
+            pango_attr_list_unref(al);
+        }
+        cairo_set_source_rgba(cv.cr, 1, 1, 1, 1);
+        cairo_move_to(cv.cr, 0, y);
+        pango_cairo_show_layout(cv.cr, pl);
+        g_object_unref(pl);
+    }
+    auto b = std::make_shared<SubsBitmap>();
+    b->w = bw, b->h = bh, b->x = (fw - bw) / 2;
+    b->y = (uint32_t)(fh * 0.145f);  // just below the battle turn-order bar
+    b->rgba.resize((size_t)bw * bh);
+    const uint8_t* src = cv.data();
+    for (uint32_t y = 0; y < bh; y++) {
+        const uint32_t* s = (const uint32_t*)(src + (size_t)y * cv.stride());
+        for (uint32_t x = 0; x < bw; x++) {
+            const uint32_t p = s[x];
+            b->rgba[(size_t)y * bw + x] = (p & 0xff00ff00) | ((p >> 16) & 0xff) | ((p & 0xff) << 16);  // BGRA -> RGBA
+        }
+    }
+    return b;
+}
+#endif
 
 void worker() {
     for (;;) {

@@ -41,17 +41,30 @@ double fmin(double, double);
 float fminf(float, float);
 double fmax(double, double);
 float fmaxf(float, float);
+#ifdef _WIN32
 typedef struct __declspec(align(16)) { unsigned long long Part[2]; } _SETJMP_FLOAT128;
 typedef _SETJMP_FLOAT128 jmp_buf[16];
 int __cdecl _setjmp(jmp_buf);
 #define setjmp _setjmp
 #define NX_API __declspec(dllimport)
 #else
+/* Linux (game.so): glibc's x86-64 jmp_buf (struct __jmp_buf_tag[1], 200 bytes); _setjmp does not save the signal mask.
+ * The C library functions resolve against the libc / libm that tms already loaded. */
+typedef long long jmp_buf[25];
+int _setjmp(jmp_buf);
+#define setjmp _setjmp
+#define NX_API __attribute__((visibility("default")))
+#endif
+#else
 #include <math.h>
 #include <setjmp.h>
 #include <stdint.h>
 #include <string.h>
+#ifdef _WIN32
 #define NX_API __declspec(dllexport) /* tms.exe exports what game.dll calls */
+#else
+#define NX_API __attribute__((visibility("default"))) /* tms (linked with -rdynamic) exports what game.so calls */
+#endif
 #endif
 
 #ifdef __cplusplus
@@ -91,8 +104,28 @@ typedef struct {
 
 #ifdef NX_GAME_DLL
 /* defined in table.c; tms.exe reaches them (and the other tables) through game.dll's exports (dispatch.cpp game_load) */
+#ifdef _WIN32
 extern GuestFn g_hooks[];
 extern GuestFn g_probes[];  /* observers of names-file functions: run at entry, then the function itself */
+#else
+/* game.so is compiled with -fvisibility=hidden (direct calls between the generated files, no PLT); these declarations
+ * give table.c's definitions default visibility, so they are the library's only exports (dispatch.cpp game_load) */
+#define NX_TABLE extern __attribute__((visibility("default")))
+NX_TABLE GuestFn g_hooks[];
+NX_TABLE GuestFn g_probes[];  /* observers of names-file functions: run at entry, then the function itself */
+NX_TABLE const GuestFunc g_guest_funcs[];
+NX_TABLE const uint32_t g_guest_func_count;
+NX_TABLE const GuestHookName g_hook_names[];
+NX_TABLE const uint32_t g_hook_count;
+NX_TABLE const GuestHookName g_hook_aliases[];
+NX_TABLE const uint32_t g_hook_alias_count;
+NX_TABLE const GuestHookName g_thunks[];
+NX_TABLE const uint32_t g_thunk_count;
+NX_TABLE const GuestModule g_modules[];
+NX_TABLE const uint32_t g_module_count;
+NX_TABLE const uint32_t g_image_size;
+#undef NX_TABLE
+#endif
 #endif
 
 /* runtime entry points (runtime/src) */

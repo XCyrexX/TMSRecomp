@@ -3,6 +3,7 @@
 // tms.exe, which the setup downloads from NVIDIA's DLSS repository only when the player ticks it. The few NGX types and
 // parameter names below are written from NVIDIA's documented ABI. Without the driver core, the DLL or an RTX GPU every call
 // says "not available" and the caller uses FSR 3.
+#ifdef _WIN32
 #include "rt.h"
 #include "vk.h"
 #include <windows.h>
@@ -240,3 +241,25 @@ bool dlss_dispatch(const Fsr3Frame& f) {
 }
 
 }  // namespace vk
+#else
+// Linux: NGX (DLSS) is reached through NVIDIA's SDK libraries, not wired up here yet: DLSS not available, the caller
+// uses the next option.
+#include "rt.h"
+#include "vk.h"
+
+#include <vector>
+
+using namespace rt;
+
+namespace vk {
+void dlss_instance_exts(std::vector<const char*>&) {}
+void dlss_device_exts(const std::vector<VkExtensionProperties>&, std::vector<const char*>&) {}
+bool dlss_ready() {
+    static bool said = false;
+    if (!said) said = true, log("dlss: not available on Linux yet: DLSS off");
+    return false;
+}
+void dlss_jitter(uint64_t, float, float* jx, float* jy) { *jx = *jy = 0; }
+bool dlss_dispatch(const Fsr3Frame&) { return false; }
+}  // namespace vk
+#endif

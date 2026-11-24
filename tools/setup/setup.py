@@ -4,6 +4,9 @@
     python setup.py --folder <folder with exefs\\ and romfs\\> [--no-shaders]
     python setup.py --dlss-only      (only the optional NVIDIA DLSS download; --dlss adds it to a full setup)
 
+Linux: the same steps with tools from the system (clang + lld, nstool, dotnet or a self-contained NxShader): game.so
+next to tms (--install, default as on Windows), nstool from --nstool, <setup>/nstool or PATH. No DLSS download.
+
 Release layout (tools/package/package.ps1 -Setup): <install>\\tms.exe, <install>\\shaderc\\, and <install>\\setup\\ with
 python\\, llvm\\ (clang.exe, lld-link.exe), nstool.exe, sdk\\ (guest.h, tms.lib, CRT import libs, game.def) and tools\\
 (this folder's siblings, same layout as the repo's tools\\). Nothing of the game is shipped: every step runs here.
@@ -23,6 +26,7 @@ import threading
 import time
 import urllib.request
 
+LINUX = sys.platform.startswith("linux")
 HERE = os.path.dirname(os.path.abspath(__file__))
 TOOLS = os.path.dirname(HERE)
 SETUP_ROOT = os.path.dirname(TOOLS)
@@ -307,7 +311,15 @@ def main():
     ap.add_argument("--mod", help="extra: mod folder (.xdelta patches or romfs\\) -> <data>\\mods\\<folder name>")
     ap.add_argument("--zip", help="extra: TMSRecomp UHD / MovieHD ZIP -> unpacked into <data>")
     ap.add_argument("--music", help="extra: folder with .adx battle music -> <data>\\music")
+    ap.add_argument("--nstool", help="nstool program (default: next to this setup, else on PATH)")
+    ap.add_argument("--clang", help="Linux: clang (default: on PATH)")
     a = ap.parse_args()
+    if LINUX and (a.dlss or a.dlss_only):
+        say("dlss: not available on Linux")
+        a.dlss = False
+        if a.dlss_only:
+            say("DONE")
+            return
     for arg, f in ((a.mod, install_mod), (a.zip, install_zip), (a.music, install_music)):
         if arg:
             if not (a.data and os.path.isdir(os.path.join(a.data, "romfs"))):
@@ -331,10 +343,17 @@ def main():
     data = os.path.abspath(data)
     os.makedirs(os.path.join(data, "setup"), exist_ok=True)
     py = sys.executable
-    nstool = os.path.join(SETUP_ROOT, "nstool.exe")
+    nstool = a.nstool or os.path.join(SETUP_ROOT, "nstool.exe")
     llvm = os.path.join(SETUP_ROOT, "llvm")
     sdk = os.path.join(SETUP_ROOT, "sdk")
+    if LINUX:
+        nstool = a.nstool or (os.path.join(SETUP_ROOT, "nstool") if os.path.isfile(os.path.join(SETUP_ROOT, "nstool"))
+                              else shutil.which("nstool") or "nstool")
+        if not os.path.isfile(os.path.join(sdk, "guest.h")):  # a source checkout: the repo's own header
+            sdk = os.path.join(os.path.dirname(TOOLS), "runtime", "include")
     shaderc = os.path.join(a.install, "shaderc", "NxShader.dll")
+    if not os.path.exists(shaderc) and os.path.exists(os.path.join(data, "shaderc", "NxShader.dll")):
+        shaderc = os.path.join(data, "shaderc", "NxShader.dll")  # a source build: <data>/shaderc, where tms also looks
     # a step is redone when its marker is missing or older than its tool (an update re-runs only what changed)
     def done(step, *deps):
         m = os.path.join(data, "setup", step + ".done")
@@ -376,16 +395,26 @@ def main():
         run([py, lifter[0], os.path.join(data, "link"), os.path.join(data, "gen")], "lift")
         mark("lift")
 
-    say("STEP", 5, 6, "Compiling the game code (game.dll)")
-    run([py, os.path.join(HERE, "build_game.py"), "--gen", os.path.join(data, "gen"),
-         "--obj", os.path.join(data, "setup", "obj"), "--out", os.path.join(a.install, "game.dll"),
-         "--include", sdk, "--lib", os.path.join(sdk, "tms.lib"), "--lib", os.path.join(sdk, "nx_crt_math.lib"),
-         "--lib", os.path.join(sdk, "nx_vcruntime.lib"), "--def", os.path.join(sdk, "game.def"),
-         "--clang", os.path.join(llvm, "clang.exe"), "--lld", os.path.join(llvm, "lld-link.exe")], "compile", True)
+    if LINUX:
+        say("STEP", 5, 6, "Compiling the game code (game.so)")
+        clang = a.clang or shutil.which("clang")
+        lld = shutil.which("ld.lld")
+        if not clang or not lld:
+            fail("clang and lld are needed to compile the game code (install them with your package manager)")
+        run([py, os.path.join(HERE, "build_game.py"), "--gen", os.path.join(data, "gen"),
+             "--obj", os.path.join(data, "setup", "obj"), "--out", os.path.join(a.install, "game.so"),
+             "--include", sdk, "--clang", clang, "--lld", lld], "compile", True)
+    else:
+        say("STEP", 5, 6, "Compiling the game code (game.dll)")
+        run([py, os.path.join(HERE, "build_game.py"), "--gen", os.path.join(data, "gen"),
+             "--obj", os.path.join(data, "setup", "obj"), "--out", os.path.join(a.install, "game.dll"),
+             "--include", sdk, "--lib", os.path.join(sdk, "tms.lib"), "--lib", os.path.join(sdk, "nx_crt_math.lib"),
+             "--lib", os.path.join(sdk, "nx_vcruntime.lib"), "--def", os.path.join(sdk, "game.def"),
+             "--clang", os.path.join(llvm, "clang.exe"), "--lld", os.path.join(llvm, "lld-link.exe")], "compile", True)
 
     if not a.no_shaders and not done("shaders", shaderc, os.path.join(TOOLS, "shaderscan", "shaderscan.py")):
         say("STEP", 6, 6, "Translating all shaders (no shader stutter later)")
-        if not shutil.which("dotnet") and not os.path.exists(os.path.join(os.path.dirname(shaderc), "hostfxr.dll")):
+        if not shutil.which("dotnet") and not os.path.exists(os.path.join(os.path.dirname(shaderc), "libhostfxr.so" if LINUX else "hostfxr.dll")):
             fail("the .NET runtime is not installed (needed for the shader translator, see README)")
         run([py, os.path.join(TOOLS, "shaderscan", "shaderscan.py"), data, "--dll", shaderc, "--set-aside"], "shader scan")
         mark("shaders")

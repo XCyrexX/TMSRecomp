@@ -90,6 +90,9 @@ class Sidecar:
     def __init__(self, dll):
         sc = os.path.join(os.path.dirname(dll), "hostfxr.dll")  # self-contained build (release ZIP): no .NET install
         cmd = [os.path.abspath(dll[:-4] + ".exe")] if os.path.exists(sc) else ["dotnet", dll]
+        if sys.platform.startswith("linux"):  # self-contained linux-x64 publish: NxShader + libhostfxr.so
+            sc = os.path.join(os.path.dirname(dll), "libhostfxr.so")
+            cmd = [os.path.abspath(dll[:-4])] if os.path.exists(sc) else ["dotnet", dll]
         self.p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
 
     def rd(self, n):

@@ -1,6 +1,6 @@
 // nn::oe, nn::account, nn::time, nn::diag, nv::, glslc: the application-facing services main imports.
 // Hooked at the nn:: API level (the SDK's IPC clients behind them are never reached).
-#include <windows.h>
+#include "plat.h"
 #include <algorithm>
 
 #include <ctime>
@@ -691,7 +691,11 @@ static void autosave_try(Cpu* c) {
         std::vector<uint8_t> data((const uint8_t*)GPTR(buf), (const uint8_t*)GPTR(buf) + size);
         gcall(c, 0x5a87f8, {buf});
         std::thread([data = std::move(data)] {
+#ifdef _WIN32
             const std::string dir = getenv("NX_SAVE_DIR") ? std::string(getenv("NX_SAVE_DIR")) + "\\" : g_data_dir + "\\save\\", tmp = dir + "save_20.tmp", dst = dir + "save_20.bin";
+#else
+            const std::string dir = getenv("NX_SAVE_DIR") ? std::string(getenv("NX_SAVE_DIR")) + "/" : g_data_dir + "/save/", tmp = dir + "save_20.tmp", dst = dir + "save_20.bin";
+#endif
             FILE* f = fopen(tmp.c_str(), "wb");
             bool ok = f && fwrite(data.data(), 1, data.size(), f) == data.size();
             if (f) ok = fclose(f) == 0 && ok;
@@ -995,11 +999,18 @@ static const uint32_t SKILL_TABLE_PTR = 0x9f3d7c;  // *ptr + 0xc = StSkillTable.
 static std::vector<std::vector<uint32_t>> find_bytes(const std::vector<std::string_view>& pats) {
     std::vector<std::vector<uint32_t>> out(pats.size());
     for (uint64_t a = 0x1000; a < 0x100000000ull;) {
+#ifdef _WIN32
         MEMORY_BASIC_INFORMATION mi{};
         if (!VirtualQuery(GPTR((uint32_t)a), &mi, sizeof mi)) break;
         uint64_t end = a + ((uint8_t*)mi.BaseAddress + mi.RegionSize - (uint8_t*)GPTR((uint32_t)a));
         if (end > 0x100000000ull) end = 0x100000000ull;
         if (mi.State == MEM_COMMIT && !(mi.Protect & (PAGE_NOACCESS | PAGE_GUARD))) {
+#else
+        const Region rg = mem_query((uint32_t)a);  // the runtime's own region map (every mapped region is readable)
+        uint64_t end = std::min<uint64_t>((uint64_t)rg.addr + (rg.size ? rg.size : 0x1000), 0x100000000ull);
+        if (end <= a) end = a + 0x1000;
+        if (rg.state != MS_FREE) {
+#endif
             const uint8_t* p = (const uint8_t*)GPTR((uint32_t)a);
             const size_t len = (size_t)(end - a);
             for (size_t k = 0; k < pats.size(); k++) {
@@ -2673,7 +2684,11 @@ HLE_FN(time_Now, "_ZN2nn4time23StandardUserSystemClock14GetCurrentTimeEPNS0_9Pos
 HLE_FN(time_ToCal, "_ZN2nn4time14ToCalendarTimeEPNS0_12CalendarTimeEPNS0_22CalendarAdditionalInfoERKNS0_9PosixTimeE") {
     time_t t = (time_t)ld64(c->r[2]);
     struct tm lt;
+#ifdef _WIN32
     localtime_s(&lt, &t);
+#else
+    localtime_r(&t, &lt);
+#endif
     uint32_t cal = c->r[0], info = c->r[1];
     st16(cal, lt.tm_year + 1900);
     st8(cal + 2, lt.tm_mon + 1);

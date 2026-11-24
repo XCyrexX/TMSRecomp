@@ -12,6 +12,7 @@ tools/shaderc/bin/
 tools/shaderc/obj/
 Uncensored/
 tools/texextract/fasttex.dll
+tools/texextract/fasttex.so
 tools/texextract/fasttex.lib
 tools/texextract/fasttex.exp
 tools/spvgen/bin/

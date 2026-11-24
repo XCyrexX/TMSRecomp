@@ -4,7 +4,11 @@
 #include <stdint.h>
 #include <string.h>
 
+#ifdef _WIN32
 #define EXPORT __declspec(dllexport)
+#else
+#define EXPORT __attribute__((visibility("default")))
+#endif
 
 EXPORT uint32_t gob_block_height(uint32_t rows, uint32_t bh) {
     uint32_t gobs = (rows + 7) / 8;

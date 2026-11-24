@@ -3,9 +3,17 @@
 // overlay_update with the host pad state every loop; while a menu is open the game gets no buttons.
 // Open / close: F1, or L3 + R3 together (both sticks pressed in). Title screen: (-) opens "Exit the game?"; camp menu
 // (Y in the field): (-) opens Return to Title / Quit Game / Cancel.
-#include <windows.h>
+#include "plat.h"
+#ifdef _WIN32
 #include <d2d1.h>
 #include <dwrite.h>
+#else
+#include <SDL3/SDL.h>
+#include "draw_linux.h"
+#include <climits>
+#include <memory>
+#include <mutex>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -22,9 +30,13 @@ namespace rt {
 
 // ------------------------------------------------------------------------------------------------ settings
 static std::filesystem::path ini_path() {
+#ifdef _WIN32
     wchar_t exe[MAX_PATH];
     GetModuleFileNameW(nullptr, exe, MAX_PATH);
     return std::filesystem::path(exe).parent_path() / "settings.ini";
+#else
+    return plat::settings_ini();
+#endif
 }
 
 // Rewrites "key = value" in settings.ini (the first uncommented line with that key, else appended) and NX_KEY.
@@ -213,7 +225,11 @@ static void apply_walk(int i) {
 static void apply_exit(int) {
     log("overlay: exit chosen");
     fflush(nullptr);
+#ifdef _WIN32
     ExitProcess(0);
+#else
+    _exit(0);
+#endif
 }
 // Return to Title: first close the camp menu with B presses (the game's own back path, from any submenu), then the field
 // leaves to the title scene from its free-roam state (hle_sys.cpp field_roam_update), like the game after an event calls
@@ -393,10 +409,14 @@ static std::vector<Item> build_items() {
 }
 
 static std::string utf8(const wchar_t* w) {
+#ifdef _WIN32
     int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
     std::string s(n > 0 ? n - 1 : 0, ' ');
     if (n > 1) WideCharToMultiByte(CP_UTF8, 0, w, -1, s.data(), n, nullptr, nullptr);
     return s;
+#else
+    return draw::utf8(w);
+#endif
 }
 bool overlay_setting(const wchar_t* name, SettingItem& out) {
     for (const Item& it : build_items()) {
@@ -413,6 +433,7 @@ void overlay_apply_setting(const wchar_t* name, int choice) {
 }
 
 // ------------------------------------------------------------------------------------------------ drawing
+#ifdef _WIN32
 struct Layer {
     HWND hwnd = nullptr;
     HDC mem = nullptr;
@@ -498,6 +519,73 @@ static void fill(float x, float y, float w, float h, float radius, D2D1::ColorF 
     b->Release();
 }
 
+#else  // Linux: each layer is a bitmap blended into the frame by the present path (frame_overlay below)
+namespace D2D1 {
+struct ColorF {
+    float r, g, b, a;
+    ColorF(float r_, float g_, float b_, float a_ = 1) : r(r_), g(g_), b(b_), a(a_) {}
+};
+}  // namespace D2D1
+using DWRITE_FONT_WEIGHT = int;
+constexpr int DWRITE_FONT_WEIGHT_NORMAL = 400, DWRITE_FONT_WEIGHT_SEMI_BOLD = 600, DWRITE_FONT_WEIGHT_BOLD = 700;
+enum DWRITE_TEXT_ALIGNMENT { DWRITE_TEXT_ALIGNMENT_LEADING = draw::LEADING, DWRITE_TEXT_ALIGNMENT_TRAILING = draw::TRAILING,
+                             DWRITE_TEXT_ALIGNMENT_CENTER = draw::CENTER };
+struct RECT { int left, top, right, bottom; };
+struct POINT { int x, y; };
+
+struct Layer {
+    std::unique_ptr<draw::Canvas> cv;
+    int x = 0, y = 0, w = 0, h = 0;  // in window pixels
+    bool shown = false;
+    std::shared_ptr<const SubsBitmap> bmp;  // what frame_overlay blends (g_layer_lock)
+};
+static std::mutex g_layer_lock;
+static int g_layer_win_w = 0, g_layer_win_h = 0;  // the window size the layers were laid out for (g_layer_lock)
+static cairo_t* g_cr;
+
+static bool init_d2d() { return true; }
+
+static void layer_hide(Layer& l) {
+    std::lock_guard<std::mutex> lk(g_layer_lock);
+    l.shown = false;
+    l.bmp = nullptr;
+}
+
+template <class F>
+static void layer_show(Layer& l, int x, int y, int w, int h, F fn) {
+    if (w <= 0 || h <= 0) return;
+    if (!l.cv || l.cv->w != w || l.cv->h != h) l.cv = std::make_unique<draw::Canvas>(w, h);
+    l.cv->clear();
+    g_cr = l.cv->cr;
+    fn();
+    g_cr = nullptr;
+    auto b = std::make_shared<SubsBitmap>();
+    b->w = (uint32_t)w, b->h = (uint32_t)h;
+    b->rgba.resize((size_t)w * h);
+    const uint8_t* src = l.cv->data();
+    for (int yy = 0; yy < h; yy++) {
+        const uint32_t* s = (const uint32_t*)(src + (size_t)yy * l.cv->stride());
+        uint32_t* d = b->rgba.data() + (size_t)yy * w;
+        for (int xx = 0; xx < w; xx++) d[xx] = (s[xx] & 0xff00ff00) | ((s[xx] >> 16) & 0xff) | ((s[xx] & 0xff) << 16);  // BGRA -> RGBA
+    }
+    std::lock_guard<std::mutex> lk(g_layer_lock);
+    l.x = x, l.y = y, l.w = w, l.h = h, l.shown = true;
+    l.bmp = b;
+}
+
+static void text(const wchar_t* s, float x, float y, float w, float h, float size, D2D1::ColorF color,
+                 DWRITE_FONT_WEIGHT weight = DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                 DWRITE_TEXT_ALIGNMENT align = DWRITE_TEXT_ALIGNMENT_LEADING) {
+    draw::text(g_cr, draw::utf8(s), x, y, w, h, size, {color.r, color.g, color.b, color.a}, weight, (draw::Align)align);
+}
+
+static void fill(float x, float y, float w, float h, float radius, D2D1::ColorF color) {
+    draw::round_rect(g_cr, x, y, w, h, radius);
+    draw::set(g_cr, {color.r, color.g, color.b, color.a});
+    cairo_fill(g_cr);
+}
+#endif
+
 static const D2D1::ColorF k_bg(0.05f, 0.06f, 0.08f, 0.88f), k_lime(0.62f, 0.95f, 0.16f, 1), k_white(1, 1, 1, 1),
     k_grey(0.75f, 0.78f, 0.82f, 1), k_row(1, 1, 1, 0.06f);
 
@@ -566,12 +654,27 @@ bool overlay_update(void* hwnd, uint64_t buttons, int ly, bool f1) {
     }
 
     // layout in the game window's client area, scaled to its height (1080 = 1.0)
+#ifdef _WIN32
     RECT cr;
     GetClientRect((HWND)hwnd, &cr);
     POINT org{0, 0};
     ClientToScreen((HWND)hwnd, &org);
     const float s = std::max(0.5f, (cr.bottom - cr.top) / 1080.0f);
     const bool visible = IsWindowVisible((HWND)hwnd) && !IsIconic((HWND)hwnd);
+#else
+    // layers in window pixels from the window's corner: frame_overlay maps them onto the frame
+    int ww = 0, wh = 0;
+    SDL_GetWindowSizeInPixels((SDL_Window*)hwnd, &ww, &wh);
+    RECT cr{0, 0, ww, wh};
+    POINT org{0, 0};
+    const float s = std::max(0.5f, (cr.bottom - cr.top) / 1080.0f);
+    const bool visible = ww > 0 && wh > 0 && !(SDL_GetWindowFlags((SDL_Window*)hwnd) & (SDL_WINDOW_HIDDEN | SDL_WINDOW_MINIMIZED));
+    {
+        std::lock_guard<std::mutex> lk(g_layer_lock);
+        if (g_layer_win_w != ww || g_layer_win_h != wh) dirty = true;  // a new size: lay out again
+        g_layer_win_w = ww, g_layer_win_h = wh;
+    }
+#endif
 
     static bool menu_drawn = false;
     if (menu && visible) {
@@ -661,5 +764,83 @@ bool overlay_update(void* hwnd, uint64_t buttons, int ly, bool f1) {
     if (swallow && !buttons) swallow = false;
     return menu || confirm || swallow;
 }
+
+#ifdef _WIN32
+std::shared_ptr<const SubsBitmap> frame_overlay(uint32_t fw, uint32_t fh) { return subs_frame(fw, fh); }
+#else
+// The present path's overlay for a fw x fh frame: the subtitles plus the menu layers (laid out in window pixels, scaled
+// to the frame when it has another size), as one bitmap. Rebuilt only when one of them changed.
+std::shared_ptr<const SubsBitmap> frame_overlay(uint32_t fw, uint32_t fh) {
+    auto subs = subs_frame(fw, fh);
+    int ww, wh;
+    struct Placed { std::shared_ptr<const SubsBitmap> b; int x, y; };
+    std::vector<Placed> parts;
+    {
+        std::lock_guard<std::mutex> lk(g_layer_lock);
+        for (Layer* l : {&g_menu_layer, &g_hint_layer})
+            if (l->shown && l->bmp) parts.push_back({l->bmp, l->x, l->y});
+        ww = g_layer_win_w, wh = g_layer_win_h;
+    }
+    if (parts.empty()) return subs;
+    static std::mutex m;
+    std::lock_guard<std::mutex> lk(m);  // two present paths (staging slots, screenshots) may ask at once
+    static std::shared_ptr<const SubsBitmap> cached, cached_subs;
+    static std::vector<const SubsBitmap*> cached_parts;
+    static uint32_t cached_w = 0, cached_h = 0;
+    std::vector<const SubsBitmap*> keys;
+    for (auto& p : parts) keys.push_back(p.b.get());
+    if (cached && cached_subs == subs && cached_parts == keys && cached_w == fw && cached_h == fh) return cached;
+    const float sx = ww > 0 ? (float)fw / ww : 1.f, sy = wh > 0 ? (float)fh / wh : 1.f;
+    struct R { int x0, y0, x1, y1; };
+    std::vector<R> rs;
+    R u{INT_MAX, INT_MAX, INT_MIN, INT_MIN};
+    auto add = [&](R r) {
+        r.x0 = std::clamp(r.x0, 0, (int)fw), r.x1 = std::clamp(r.x1, 0, (int)fw);
+        r.y0 = std::clamp(r.y0, 0, (int)fh), r.y1 = std::clamp(r.y1, 0, (int)fh);
+        rs.push_back(r);
+        if (r.x1 > r.x0 && r.y1 > r.y0) u = {std::min(u.x0, r.x0), std::min(u.y0, r.y0), std::max(u.x1, r.x1), std::max(u.y1, r.y1)};
+    };
+    if (subs) add({(int)subs->x, (int)subs->y, (int)(subs->x + subs->w), (int)(subs->y + subs->h)});
+    for (auto& p : parts) add({(int)(p.x * sx), (int)(p.y * sy), (int)((p.x + p.b->w) * sx), (int)((p.y + p.b->h) * sy)});
+    if (u.x1 <= u.x0 || u.y1 <= u.y0) return subs;
+    auto out = std::make_shared<SubsBitmap>();
+    out->x = (uint32_t)u.x0, out->y = (uint32_t)u.y0, out->w = (uint32_t)(u.x1 - u.x0), out->h = (uint32_t)(u.y1 - u.y0);
+    out->rgba.assign((size_t)out->w * out->h, 0);
+    // the unscaled rectangle of each part (the source size): scale back into it with nearest samples
+    std::vector<std::pair<uint32_t, uint32_t>> src_size;
+    if (subs) src_size.push_back({subs->w, subs->h});
+    for (auto& p : parts) src_size.push_back({p.b->w, p.b->h});
+    auto blend = [&](const SubsBitmap& b, const R& r, const R& full) {  // premultiplied "over"
+        const int fwid = full.x1 - full.x0, fhgt = full.y1 - full.y0;
+        if (fwid <= 0 || fhgt <= 0) return;
+        for (int y = r.y0; y < r.y1; y++) {
+            const uint32_t sy_ = std::min<uint32_t>(b.h - 1, (uint32_t)((uint64_t)(y - full.y0) * b.h / fhgt));
+            uint32_t* d = out->rgba.data() + (size_t)(y - u.y0) * out->w;
+            for (int x = r.x0; x < r.x1; x++) {
+                const uint32_t sx_ = std::min<uint32_t>(b.w - 1, (uint32_t)((uint64_t)(x - full.x0) * b.w / fwid));
+                const uint32_t s = b.rgba[(size_t)sy_ * b.w + sx_], a = s >> 24;
+                uint32_t& o = d[x - u.x0];
+                if (!a) continue;
+                if (a == 255) { o = s; continue; }
+                uint32_t v = 0;
+                for (int k = 0; k < 32; k += 8)
+                    v |= std::min<uint32_t>(255, ((s >> k) & 255) + (((o >> k) & 255) * (255 - a) + 127) / 255) << k;
+                o = v;
+            }
+        }
+    };
+    size_t i = 0;
+    if (subs) {
+        const R full{(int)subs->x, (int)subs->y, (int)(subs->x + subs->w), (int)(subs->y + subs->h)};
+        blend(*subs, rs[i++], full);
+    }
+    for (auto& p : parts) {
+        const R full{(int)(p.x * sx), (int)(p.y * sy), (int)((p.x + p.b->w) * sx), (int)((p.y + p.b->h) * sy)};
+        blend(*p.b, rs[i++], full);
+    }
+    cached = out, cached_subs = subs, cached_parts = keys, cached_w = fw, cached_h = fh;
+    return out;
+}
+#endif
 
 }  // namespace rt
