@@ -1673,6 +1673,7 @@ static void scene_cam_bind(uint32_t a, uint64_t size) {
         std::string m;
         for (int i = 0; i < 128; i++) { char b[24]; snprintf(b, sizeof b, "%s%g", i % 16 ? " " : "\n  ", ldf(a + 4 * i)); m += b; }
         log("cam: block %08x target %ux%u frame %u:%s", a, g_st.colors[0]->width, g_st.colors[0]->height, (uint32_t)g_present_no, m.c_str());
+#ifdef _WIN32  // NX_CAM_FIND walks guest memory with VirtualQuery: a Windows-only debugging aid
         // debug NX_CAM_FIND=frame: at that frame, guest words equal to this block's P00 with P11 5 floats later
         static uint32_t find_at = getenv("NX_CAM_FIND") ? atoi(getenv("NX_CAM_FIND")) : 0;
         if (find_at && g_present_no >= find_at) {
@@ -1692,6 +1693,7 @@ static void scene_cam_bind(uint32_t a, uint64_t size) {
                     }
             }
         }
+#endif
     }
     if (size != 736 || !g_st.colors[0] || rt::fsr3_setting() == 0) return;
     const float w = ldf(a), h = ldf(a + 4);

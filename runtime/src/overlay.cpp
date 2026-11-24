@@ -688,6 +688,10 @@ bool overlay_update(void* hwnd, uint64_t buttons, int ly, bool f1) {
     RECT cr{0, 0, ww, wh};
     POINT org{0, 0};
     const float s = std::max(0.5f, (cr.bottom - cr.top) / 1080.0f);
+    // the game's 16:9 area in the window (ultrawide), as on Windows above
+    const float pa = 16.0f / 9 * vk::wide_factor(), cw_ = (float)cr.right, ch_ = (float)cr.bottom;
+    const float ph = std::fabs(cw_ / ch_ - pa) < pa * 0.01f ? ch_ : std::min(ch_, cw_ / pa);
+    const int ui_left = (int)((cw_ - std::min(cw_, ph * 16 / 9)) / 2), ui_bottom = (int)((ch_ + ph) / 2);
     const bool visible = ww > 0 && wh > 0 && !(SDL_GetWindowFlags((SDL_Window*)hwnd) & (SDL_WINDOW_HIDDEN | SDL_WINDOW_MINIMIZED));
     {
         std::lock_guard<std::mutex> lk(g_layer_lock);

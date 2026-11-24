@@ -358,6 +358,7 @@ void rt::profile_start() {
     }).detach();
 }
 
+#endif  // sprite_command below is plain C++: Linux too
 // NX_CONTROL "spr bank sheet n" (debug): the game's 2D sprite records (id = bank * 10^7 + sheet * 10^4 + index; lookup
 // 0x59c1a0, manager pointer at 0x9f3320): index, then the 0x70-byte record's first 16 words (rect floats / ints)
 void rt::sprite_command(const char* args) {
@@ -384,6 +385,7 @@ void rt::sprite_command(const char* args) {
         log("spr %d: %s", i, s.c_str());
     }
 }
+#ifdef _WIN32
 void rt::dump_command(const char* args) {  // pages that are not committed are written as zeros (snap4.sh, framecount.py)
     unsigned lo = 0, hi = 0;
     char path[260] = "";
