@@ -746,6 +746,7 @@ void nvn::sync_mark(uint32_t sync, uint64_t serial) {  // vk_replay.cpp: Command
 //  - the game is at most one frame ahead: a present waits until the previous present has run;
 //  - the UI clock a frame's sprites are smoothed with is the one at its submit, not at its replay.
 // At fps 30 / 60 (vsync-paced presents) and with NX_ASYNC_REPLAY=0 every job runs at once on the calling thread, as before.
+namespace vk { bool gpu_is_amd(); }  // vk.cpp
 namespace nvn {
 uint32_t g_replay_ui_tick = 0;  // vk_replay.cpp ui_sprite_smooth: the UI clock of the frame being replayed
 float g_replay_ui_frac = 1;
@@ -775,9 +776,11 @@ static void job_run(Job& j) {
     } else backend_present(j.tex);
 }
 static bool render_async() {
-    static const bool on = !getenv("NX_ASYNC_REPLAY") || atoi(getenv("NX_ASYNC_REPLAY")) != 0;
+    // NX_ASYNC_REPLAY=0: never, 2: also at 30 / 60. AMD GPUs use it at every fps: on a ROG Ally (Z1 Extreme, RADV) the
+    // game thread needs ~10-15 ms per frame for the game itself, replay on top of it missed 60 fps.
+    static const int mode = getenv("NX_ASYNC_REPLAY") ? atoi(getenv("NX_ASYNC_REPLAY")) : vk::gpu_is_amd() ? 2 : 1;
     const int fps = fps_setting();
-    return on && (fps == 0 || fps > 60);
+    return mode != 0 && (mode == 2 || fps == 0 || fps > 60);
 }
 void render_drain() {
     if (t_render) return;
