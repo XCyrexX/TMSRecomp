@@ -13,6 +13,9 @@ jobs:
   linux:
     runs-on: ubuntu-latest
     container: ubuntu:26.04
+    defaults:
+      run:
+        shell: bash
     env:
       DEBIAN_FRONTEND: noninteractive
       DOTNET_CLI_TELEMETRY_OPTOUT: '1'
@@ -32,7 +35,7 @@ jobs:
           for p in tools/shaderc/patches/*.patch; do patch -d "$RUNNER_TEMP/ryubing" -p1 < "$p"; done
       - name: nstool
         run: |
-          git clone -q --depth 1 --branch "$NSTOOL_TAG" https://github.com/jakcron/nstool.git "$RUNNER_TEMP/nstool"
+          git clone -q --depth 1 --recurse-submodules --shallow-submodules --branch "$NSTOOL_TAG" https://github.com/jakcron/nstool.git "$RUNNER_TEMP/nstool"
           make -C "$RUNNER_TEMP/nstool" deps >/dev/null
           make -C "$RUNNER_TEMP/nstool" -j"$(nproc)" >/dev/null
       - name: Build and package
