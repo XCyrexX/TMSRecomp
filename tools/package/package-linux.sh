@@ -13,7 +13,7 @@ RYU_DIR="$(realpath "${RYU_DIR:-$ROOT/private/third_party/ryubing}")"
 NSTOOL_DIR="$(realpath "${NSTOOL_DIR:-$ROOT/private/third_party/nstool}")"
 OUT="$(mkdir -p "${OUT:-$ROOT/private/dist}" && realpath "${OUT:-$ROOT/private/dist}")"
 TMS_VERSION="${TMS_VERSION:-$(git -C "$ROOT" describe --tags --abbrev=0 2>/dev/null || echo dev)}"
-TMS_VERSION="${TMS_VERSION%-beta}"
+TMS_VERSION="${TMS_VERSION%-linux}"; TMS_VERSION="${TMS_VERSION%-beta}"  # tags v0.1.4-beta / v0.1.4-linux -> v0.1.4
 B="$ROOT/private/linux-release"; ST="$OUT/stage/TMSRecomp"
 for f in "$RYU_DIR/LICENSE.txt" "$NSTOOL_DIR/bin/nstool" "$NSTOOL_DIR/LICENSE"; do [ -e "$f" ] || { echo "missing $f (see the header)"; exit 1; }; done
 
