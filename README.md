@@ -1,12 +1,12 @@
 <h1 align="center">TMSRecomp</h1>
 
-<p align="center"><b>Tokyo Mirage Sessions #FE Encore, running natively on Windows.</b><br>
+<p align="center"><b>Tokyo Mirage Sessions #FE Encore, running natively on Windows and Linux.</b><br>
 Up to 4K and 240 fps · DLSS 4.5 / FSR 3 · VRR · one-click setup and updates · no emulator</p>
 
 <p align="center">
   <a href="../../releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/godofknife/TMSRecomp?include_prereleases&label=release&color=3ee08f"></a>
   <a href="../../releases"><img alt="Downloads" src="https://img.shields.io/github/downloads/godofknife/TMSRecomp/total?color=3ee08f"></a>
-  <img alt="Platform" src="https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-blue">
+  <img alt="Platform" src="https://img.shields.io/badge/platform-Windows%2010%20%7C%2011%20%7C%20Linux-blue">
   <img alt="Vulkan" src="https://img.shields.io/badge/graphics-Vulkan%201.3-red">
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-GPL--2.0--or--later-lightgrey"></a>
 </p>
@@ -67,6 +67,7 @@ Sessions #FE Encore and all related names, characters and assets are trademarks 
 - [What's new in v0.1.2](#whats-new-in-v012)
 - [Requirements](#requirements)
 - [Installing and playing](#installing-and-playing)
+- [Playing on Linux (Steam Deck, Bazzite, ROG Ally)](#playing-on-linux)
 - [Updating](#updating)
 - [Extras: English patch, UHD textures, 4K movies, your own music](#extras)
 - [Controls](#controls)
@@ -224,6 +225,26 @@ tools look closely at a program that runs a compiler; everything stays inside th
 
 Command line: `tms.exe --data <folder>` uses another game files folder; `--set key=value` overrides any setting for one
 run (repeatable), for example `tms.exe --set window=window --set res=1080p --set fps=60`.
+
+## Playing on Linux
+
+A native Linux x86-64 build (no Wine or Proton), tested on a ROG Ally (Z1 Extreme, Bazzite: 60 fps on Balanced, battles
+included), an NVIDIA GTX 1650 and an Intel UHD 770. Other AMD GPUs and the Steam Deck use the same driver as the Ally.
+
+1. Download `TMSRecomp-<version>-linux.tar.gz` from the [Releases](../../releases) page and extract it anywhere you can
+   write to (for example `~/Games/TMSRecomp`).
+2. Install what the setup uses (once):
+   - Ubuntu / Debian: `sudo apt install python3-capstone clang lld`
+   - Fedora: `sudo dnf install python3-capstone clang lld`
+   - Arch: `sudo pacman -S python-capstone clang lld`
+   - Bazzite / SteamOS (read-only system): `pip install --user capstone`, and clang + lld in a toolbox or distrobox
+3. Run `./launcher`: the same **Setup** page as on Windows (NSP + `prod.keys`, or an extracted folder). It builds `game.so`
+   from your own dump.
+4. Press **PLAY**. To play from Steam (Gaming Mode), add `launcher` (or `tms`) as a non-Steam game.
+
+Needs glibc 2.43 or newer (Bazzite, SteamOS 3.8+, Fedora 44, Ubuntu 26.04, Arch), a Vulkan 1.3 GPU, and cairo / pango
+(on every desktop). No FSR 3 and no DLSS on Linux: they fall back to SMAA; FXAA, SMAA, MSAA, FSR 1 and sharpening work.
+Settings, saves and logs live in the game files folder as on Windows. Building it yourself: [Linux (experimental)](#linux-experimental).
 
 ## Updating
 
@@ -430,14 +451,18 @@ Never post game files, keys or links to them.
 A native Linux x86-64 build of the same runtime, launcher and setup (no Wine or Proton). As on Windows, the game is
 built on your PC from your own dump; nothing of the game is in the repository or a build.
 
-**Tested so far** (Ubuntu 26.04, NVIDIA GTX 1650, driver 620): setup from an extracted folder, launcher, title screen,
-intro movie, story scenes, field, camp menu, saving and loading, the F1 menu, at a steady 60 fps. Battles, AMD and Intel
-GPUs and the Steam Deck are not tested yet.
+**Tested so far**: Ubuntu 26.04 with an NVIDIA GTX 1650 (driver 620) and an Intel UHD 770 (Mesa ANV), and a ROG Ally
+(Z1 Extreme, Bazzite, Mesa RADV): setup from an NSP or an extracted folder, launcher, story scenes, field, camp menu,
+battles, saving and loading, the F1 menu. 60 fps on the GTX 1650 at 1080p and on the Ally (Balanced power mode).
+
+**Release package**: `tools/package/package-linux.sh` (the Linux counterpart of `package.ps1`) builds
+`TMSRecomp-<version>-linux.tar.gz` without any game code; `.github/workflows/linux.yml` runs it on every version tag on
+Ubuntu 26.04 (Ryubing source with the patches in `tools/shaderc/patches`, nstool 1.9.2) and attaches it to the release.
 
 **Differences from Windows**
 - No AMD FSR 3 and no NVIDIA DLSS: AMD ships the FidelityFX API only as Windows DLLs, and the NGX (DLSS) path is not
   wired up. Choosing them falls back to SMAA, as on a Windows PC without them. FXAA, SMAA, MSAA, FSR 1 and sharpening work.
-- The launcher's Update button opens the release page (releases are Windows downloads).
+- The launcher's Update button opens the release page.
 - `settings.ini` sits next to `tms` when that folder is writable, else in `~/.config/TMSRecomp/settings.ini` (an
   AppImage or system install); `NX_INI` overrides it. The recompiled code is `game.so` next to `tms`, or where
   `NX_GAME_SO` points.
