@@ -46,6 +46,7 @@ Region mem_query(uint32_t addr);
 double process_private_mb(), guest_committed_mb();  // memory.cpp
 void mem_regions_report();  // memory.cpp, NX_MEM_REGIONS
 bool mem_written(uint32_t addr, uint32_t size);  // CPU wrote the range since the last call (write watch)
+void mem_next_frame();  // Linux: a new frame for the imported-page checks (no-op on Windows)
 // the same, but the write watch of [span_lo, span_lo + span_len) (the texture's memory pool) is read once per stamp (submit)
 bool mem_written_span(uint32_t addr, uint32_t size, uint32_t span_lo, uint32_t span_len, uint64_t stamp);
 void mem_make_writable(uint32_t addr, uint32_t size);  // Linux: open watched pages before a driver pins them (no-op on Windows)
@@ -65,6 +66,7 @@ extern const GuestModule* g_modules;
 extern uint32_t g_module_count, g_image_size;
 void dispatch_init();
 GuestFn lookup(uint32_t addr);
+void sampler_start();  // dispatch.cpp: NX_SAMPLE CPU sampling profiler (Linux)
 const char* symbol_at(uint32_t addr);  // nearest exported symbol at or below addr (for logs)
 uint32_t export_addr(const char* name);  // 0 if missing
 void cover_report();  // NX_COVER: log probed functions called since the last report

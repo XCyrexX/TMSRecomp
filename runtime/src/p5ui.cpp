@@ -4,12 +4,14 @@
 // black label with a red edge and the pad button that picks it (ui.cpp poll_input; positions: bottom Attack, right
 // Guard, top Skills, left Items; L Tactics, R Change, - Escape), laid out like the pad's face. Windows (Direct2D) only
 // for now; Linux keeps the game's wheel.
+#include "plat.h"  // Linux: GetTickCount64
 #include "rt.h"
 #ifdef _WIN32
 #include <d2d1.h>
 #include <dwrite.h>
 #include <wincodec.h>
 #endif
+#include <algorithm>
 #include <cmath>
 #include <mutex>
 

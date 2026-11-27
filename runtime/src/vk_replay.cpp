@@ -1983,7 +1983,7 @@ static VkDescriptorSet bind_resources(VkCommandBuffer cb, Combo* pv) {
                 Binding b = r.kind == 1 ? global_binding(nst, r.handle) : idx >= 0 && idx < 18 ? g_st.ubuf[nst][idx] : Binding{};
                 if (r.kind == 0 && r.slot == 1) b = {st.consts, st.consts_size};  // c1 = the shader's constant data
                 if (r.kind == 0 && nst == 0 && idx == 1 && b.addr) scene_cam_bind((uint32_t)b.addr, b.size);
-                GuestBuffer gb = guest_buffer(b.addr);
+                GuestBuffer gb = guest_buffer(b.addr, b.size ? b.size : 65536);
                 if (!gb.buf) {
                     static std::set<std::pair<VkShaderModule, int>> told;
                     if (told.insert({st.module, r.slot}).second)
@@ -2291,7 +2291,7 @@ static void ui_edge_extend(VkCommandBuffer cb, const Cmd& k, const VkViewport& v
     vkCmdSetScissor(cb, 0, 1, &c2);
     vkCmdBindVertexBuffers(cb, 0, 1, &buf, &off);
     vkCmdDraw(cb, n, 1, 0, 0);
-    GuestBuffer gb = guest_buffer(g_st.vbuf[0].addr);
+    GuestBuffer gb = guest_buffer(g_st.vbuf[0].addr, g_st.vbuf[0].size);
     if (gb.buf) vkCmdBindVertexBuffers(cb, 0, 1, &gb.buf, &gb.offset);
     vkCmdSetViewport(cb, 0, 1, &vp);
     vkCmdSetScissor(cb, 0, 1, &sc);
@@ -2352,7 +2352,7 @@ static void ui_grid_extend(VkCommandBuffer cb, const Cmd& k, const VkViewport& v
     vkCmdSetScissor(cb, 0, 1, &c2);
     vkCmdBindVertexBuffers(cb, 0, 1, &buf, &off);
     vkCmdDraw(cb, nv, 1, 0, 0);
-    GuestBuffer gb = guest_buffer(g_st.vbuf[0].addr);
+    GuestBuffer gb = guest_buffer(g_st.vbuf[0].addr, g_st.vbuf[0].size);
     if (gb.buf) vkCmdBindVertexBuffers(cb, 0, 1, &gb.buf, &gb.offset);
     vkCmdSetViewport(cb, 0, 1, &vp);
     vkCmdSetScissor(cb, 0, 1, &sc);
@@ -2722,7 +2722,7 @@ static void draw(VkCommandBuffer cb, const Cmd& k) {
         VKC(vkBindBufferMemory(dev, zero_vb, m, off));
     }
     for (uint32_t s = 0; s < 16; s++) {
-        GuestBuffer gb = g_st.vbuf[s].addr ? guest_buffer(g_st.vbuf[s].addr) : GuestBuffer{VK_NULL_HANDLE, 0};
+        GuestBuffer gb = g_st.vbuf[s].addr ? guest_buffer(g_st.vbuf[s].addr, g_st.vbuf[s].size) : GuestBuffer{VK_NULL_HANDLE, 0};
         VkDeviceSize zo = 0;
         if (gb.buf) vkCmdBindVertexBuffers(cb, s, 1, &gb.buf, &gb.offset);
         else vkCmdBindVertexBuffers(cb, s, 1, &zero_vb, &zo);
@@ -2759,7 +2759,8 @@ static void draw(VkCommandBuffer cb, const Cmd& k) {
             break;
         case OP_DRAW_INDEXED:            // mode, type, count, addr64, base vertex (BaseVertex variant)
         case OP_DRAW_INDEXED_INSTANCED: {  // mode, type, count, addr64, base vertex, base instance, instance count
-            GuestBuffer gb = guest_buffer((uint64_t)k.a[4] << 32 | k.a[3]);
+            // indices read: count x 1 / 2 / 4 bytes (type 0 / 1 / 2)
+            GuestBuffer gb = guest_buffer((uint64_t)k.a[4] << 32 | k.a[3], (uint64_t)k.a[2] << std::min<uint32_t>(k.a[1], 2));
             if (!gb.buf) {
                 if (g_skip[4]++ < 5) log("vk: index buffer %08x%08x (draw args %08x %08x %08x %08x %08x %08x) not in a pool", k.a[4], k.a[3], k.a[0], k.a[1], k.a[2], k.a[3], k.a[4], k.a[5]);
                 return;
@@ -2866,7 +2867,7 @@ void replay(VkCommandBuffer cb, const std::vector<Cmd>& cmds) {
             }
             case OP_COPY_BUF_BUF: {  // (r1 padding), src addr64, dst addr64, size (32-bit size_t), flags
                 end_rendering(cb);
-                GuestBuffer src = guest_buffer((uint64_t)k.a[2] << 32 | k.a[1]), dst = guest_buffer((uint64_t)k.a[4] << 32 | k.a[3]);
+                GuestBuffer src = guest_buffer((uint64_t)k.a[2] << 32 | k.a[1], k.a[5]), dst = guest_buffer((uint64_t)k.a[4] << 32 | k.a[3], k.a[5]);
                 if (!src.buf || !dst.buf || !k.a[5]) {
                     static int bad = 0;
                     if (bad++ < 5) log("vk: skipped buffer copy %08x%08x -> %08x%08x size %u", k.a[2], k.a[1], k.a[4], k.a[3], k.a[5]);
@@ -2883,7 +2884,12 @@ void replay(VkCommandBuffer cb, const std::vector<Cmd>& cmds) {
                 Texture* t = get<Texture>(k.a[2]);
                 Image* im = image_of(t);
                 ms_flush_one(cb, "copy buf-tex", im);
-                GuestBuffer gb = guest_buffer((uint64_t)k.a[1] << 32 | k.a[0]);
+                GuestBuffer gb{VK_NULL_HANDLE, 0};
+                if (im && k.blob.size() >= 24) {  // bytes read: the region at up to 16 bytes per texel
+                    int32_t r6[6];
+                    memcpy(r6, k.blob.data(), 24);
+                    gb = guest_buffer((uint64_t)k.a[1] << 32 | k.a[0], (uint64_t)std::max(1, r6[3]) * std::max(1, r6[4]) * std::max(1, r6[5]) * 16);
+                }
                 if (!im || !gb.buf || k.blob.size() < 24) break;
                 int32_t rg[6];
                 memcpy(rg, k.blob.data(), 24);
@@ -3063,7 +3069,7 @@ void replay(VkCommandBuffer cb, const std::vector<Cmd>& cmds) {
             case OP_ALPHA_REF: memcpy(&g_st.alpha_ref, &k.a[0], 4); break;
             case OP_INLINE_UNIFORM: {  // update buffer contents in GPU order
                 end_rendering(cb);
-                GuestBuffer gb = guest_buffer((uint64_t)k.a[1] << 32 | k.a[0]);
+                GuestBuffer gb = guest_buffer((uint64_t)k.a[1] << 32 | k.a[0], (uint64_t)k.a[2] + k.blob.size());
                 if (!gb.buf || k.blob.empty() || k.blob.size() > 65536 || ((gb.offset + k.a[2]) & 3) ||
                     gb.size < k.a[2] + k.blob.size()) {
                     static int bad = 0;
