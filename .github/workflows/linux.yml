@@ -1,0 +1,56 @@
+# Linux download: on every version tag (and by hand from the Actions tab) GitHub builds TMSRecomp-<version>-linux.tar.gz
+# (tools/package/package-linux.sh) and attaches it to that tag's release (created if missing, next to the Windows ZIP).
+# Program and setup tools only: no game code or files (the player's setup builds game.so from their own dump).
+# Ubuntu 26.04: the release needs glibc 2.43+ (Bazzite, SteamOS 3.8+, Fedora 44, Ubuntu 26.04, Arch).
+name: Linux build
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    container: ubuntu:26.04
+    defaults:
+      run:
+        shell: bash
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+      DOTNET_NOLOGO: '1'
+      RYUBING_TAG: Canary-1.3.356  # the Ryujinx source the shader translator builds against (tools/shaderc)
+      NSTOOL_TAG: v1.9.2
+    steps:
+      - name: Packages
+        run: |
+          apt-get update -q
+          apt-get install -y -q git ca-certificates curl make g++ clang lld llvm cmake ninja-build pkg-config patch \
+            libsdl3-dev libvulkan-dev libvpx-dev libcairo2-dev libpango1.0-dev dotnet-sdk-10.0 python3 binutils
+      - uses: actions/checkout@v4
+      - name: Ryujinx (Ryubing) source with our shader patches
+        run: |
+          git clone -q --depth 1 --branch "$RYUBING_TAG" https://git.ryujinx.app/ryubing/ryujinx.git "$RUNNER_TEMP/ryubing"
+          for p in tools/shaderc/patches/*.patch; do patch -d "$RUNNER_TEMP/ryubing" -p1 < "$p"; done
+      - name: nstool
+        run: |
+          git clone -q --depth 1 --recurse-submodules --shallow-submodules --branch "$NSTOOL_TAG" https://github.com/jakcron/nstool.git "$RUNNER_TEMP/nstool"
+          make -C "$RUNNER_TEMP/nstool" deps >/dev/null
+          make -C "$RUNNER_TEMP/nstool" -j"$(nproc)" >/dev/null
+      - name: Build and package
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          TMS_VERSION="${GITHUB_REF_NAME}"; case "$TMS_VERSION" in v*) ;; *) TMS_VERSION="dev-${GITHUB_SHA::7}" ;; esac
+          RYU_DIR="$RUNNER_TEMP/ryubing" NSTOOL_DIR="$RUNNER_TEMP/nstool" OUT="$RUNNER_TEMP/dist" TMS_VERSION="$TMS_VERSION" \
+            bash tools/package/package-linux.sh
+          ls -l "$RUNNER_TEMP/dist"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TMSRecomp-linux
+          path: ${{ runner.temp }}/dist/*.tar.gz
+      - name: Attach to the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ runner.temp }}/dist/*.tar.gz
